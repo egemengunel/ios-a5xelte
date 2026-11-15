@@ -506,3 +506,19 @@ path, iOS's reader will want NV12 or an mmap later.
   through the drop (`write-drop.sh app=build/trollstore/x/TrollStore.app`: hero-run moves it to /Applications on
   boot) with the use3 STAY drop. Unknown: whether trollstorehelper's root spawn/private entitlements work on this
   kernel (signing off, sweet_amfi stand-in). Owner tests on the phone; then collect the log.
+* **Published (13:45):** https://github.com/egemengunel/ios-a5xelte, branch `gracerlte`, in the S7 port's layout
+  (patches in xnu/patches, device folder `gracerlte/`, GRACERLTE_PROGRESS.md = this log, docs/gracerlte-*.md). Keep
+  working in gracerlte/ here and copy into publish/ios-a5xelte for each update (paths rewritten gracerlte/ -> gracerlte/).
+* TrollStore (troll1): hero-run put it in /Applications, `LSRegisterURL -1, registerApplication 0`, LS database
+  deleted for a rebuild (the documented first-boot case). Drop rewritten without app= (no re-register each boot),
+  rebooted 13:40: the rebuilt database should list it.
+* **TrollStore works (13:45, owner):** after the LS rebuild boot it is on the home screen; Apps/Settings tabs, ldid
+  install tapped (result not confirmed). Delta 1.6 IPA downloaded on the phone, not installed yet (getting it from
+  Safari's download into TrollStore was awkward). Next: confirm "ldid: Installed", install an IPA from Files/Share or
+  TrollStore's Install from URL; then an IPA built from source (Telegram) in CI, as the S7 port's ios-apps workflow.
+* **Paused for the week (13:50).** Owner may flash an Android ROM meanwhile (SuperFast9, Android 9, built on
+  N935FXXU4CSC5; phone bootloader N935FXXU8CVG2). That needs Format Data in TWRP, which erases the iOS install
+  (root, drop zone and log all live in USERDATA) and replaces BOOT. To come back: TWRP, then `gracerlte/flash-ios.sh`
+  with a current boot image (the everyday one is `build/boot/notefe-boot-stock-use3.img`; flash-ios.sh still names
+  notefe-boot-<level>.img, update it first), then the STAY drop and TrollStore (`app=build/trollstore/x/TrollStore.app`).
+  Everything needed is on the Mac (build/root, build/boot, backup/). EFS, RADIO, RECOVERY (TWRP) are untouched by both.
