@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 9ac25b0..ef75282 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3646,7 +3646,15 @@ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ 	if (zc_state < 0 || pa == 0 || pa + (uint64_t)bpr * h > 0x100000000ull) {
+ 		return false;
+ 	}
++	static uint32_t entered;
++	bool trace = ++entered <= 20;
++	if (trace) {
++		printf("NOTEFE ZC: flip %u: waiting for the GPU lock\n", entered);
++	}
+ 	lck_mtx_lock(hg_mtx);
++	if (trace) {
++		printf("NOTEFE ZC: flip %u: have it\n", entered);
++	}
+ 	bool ok = zc_setup_locked(bpr, w, h);
+ 	if (ok) {
+ 		uint64_t t0 = mach_absolute_time(), limit;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0ec6ed7..4d62c0c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -660,14 +660,25 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
++	static uint64_t zc_traced;
++	bool trace = show && (++zc_traced <= 20 || zc_traced % 600 == 0);
++	if (trace) {
++		IOLog("NOTEFE ZC: show %llu: swap %llu presenting\n", zc_traced, seq);
++	}
+ 	if (show) {
+ 		uint64_t before = mach_absolute_time();
+ 		uint64_t bytes = fb->present(rec);
++		if (trace) {
++			IOLog("NOTEFE ZC: show %llu: presented (zero copy %d)\n", zc_traced, notefe_zc_active());
++		}
+ 		uint64_t ns = 0;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - before, &ns);
+ 		uint64_t gap = fb->fVsyncCount - fb->fLastShown;
+ 		fb->fGaps[gap <= 1 ? 0 : gap >= 4 ? 3 : gap - 1] += gap <= 30 ? 1 : 0;
+ 		fb->fLastShown = fb->fVsyncCount;
++		if (trace) {
++			IOLog("NOTEFE ZC: show %llu: done\n", zc_traced);
++		}
+ 		IOLockLock(fb->fLock);
+ 		fb->fShownSeq = seq;                    /* (0425) SwapEnd waits for this with zero copy */
+ 		IOLockWakeup(fb->fLock, &fb->fShownSeq, false);
+@@ -1437,7 +1448,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		 * (0425) Zero copy: the display reads the surface itself, so CoreAnimation must not draw into the one it
+ 		 * gave before until this frame has replaced it on the panel (at most a refresh; 40 ms at worst).
+ 		 */
+-		if (notefe_zc_active()) {
++		static int zc_wait = -1;
++		if (zc_wait < 0) {
++			uint32_t w = 0;
++			PE_parse_boot_argn("notefe_zcwait", &w, sizeof(w));
++			zc_wait = w ? 1 : 0;    /* (0426) off by default: boot 23's work loop stopped after the first flip */
++		}
++		if (zc_wait == 1 && notefe_zc_active()) {
+ 			uint64_t deadline;
+ 			clock_interval_to_deadline(40, kMillisecondScale, &deadline);
+ 			IOLockLock(fFB->fLock);

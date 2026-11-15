@@ -1,0 +1,24 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: a scaled canvas must fit the 16 MiB reserved at 0xa0000000
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7282602..ea9605a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -266,6 +266,16 @@ AppleCLCD::start(IOService *provider)
+ 			fLogicalW = lw;
+ 			fLogicalH = lh;
+ 		}
++		/*
++		 * Note FE 0414: the default surface lives at 0xa0000000, and the RAM banks leave only the area the ADT
++		 * script reserves there (notefe-ram-banks.py: 16 MiB since boot 9). A bigger canvas wrote over the kernel's
++		 * own memory: boot 9 (1242x2208, 10.5 MB, with 8 MiB reserved) never came back. Too big: the 750x1334 one.
++		 */
++		if ((uint64_t)((fLogicalW * 4 + 63) & ~63u) * fLogicalH > (16ull << 20)) {
++			printf("NOTEFE FB: canvas %ux%u does not fit the 16 MiB at 0xa0000000: 750x1334 instead\n", fLogicalW, fLogicalH);
++			fLogicalW = 750;
++			fLogicalH = 1334;
++		}
+ 		/* sweetfb_gpu=1: full-screen frames go through the Mali instead
+ 		 * (herolte_gpu.c), bilinear; scaledCopy() stays the fallback. */
+ 		int gpu = 0;

@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 730dceb..f6c7a8b 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2325,6 +2325,11 @@ nc_csis_report(vm_offset_t csis, vm_offset_t mmu, const char *when)
+ {
+ 	uint8_t fc = 0xee;
+ 	nc_sensor_read(0x35, 0x0005, &fc, 1);
++	uint32_t s0 = notefe_rd(csis, 0x14), s1 = notefe_rd(csis, 0x1c);
++	printf("NOTEFE CAM: frame %s: ch0 start %u end %u; errors: SOT_HS %u lost FS %u lost FE %u overflow %u wrong cfg %u "
++	    "ECC %u CRC %u ID %u; DMA start %u end %u error %u\n", when, (s0 >> 24) & 1, (s0 >> 20) & 1, (s0 >> 16) & 1,
++	    (s0 >> 12) & 1, (s0 >> 8) & 1, (s0 >> 4) & 1, (s0 >> 3) & 1, (s0 >> 2) & 1, (s0 >> 1) & 1, s0 & 1, (s1 >> 4) & 1,
++	    (s1 >> 8) & 1, (s1 >> 12) & 1);
+ 	printf("NOTEFE CAM: frame %s: sensor frame count %#x; CSIS2 DPHY_STATUS %#x INT_SRC0 %#x INT_SRC1 %#x FRM_CNT_CH0 %u "
+ 	    "DMA0 ctrl %#x act %#x bytes %u; SysMMU status %#x\n", when, fc, notefe_rd(csis, 0x20), notefe_rd(csis, 0x14),
+ 	    notefe_rd(csis, 0x1c), notefe_rd(csis, 0x100), notefe_rd(csis, 0x1000), notefe_rd(csis, 0x1030),
+@@ -2390,11 +2395,17 @@ notefe_cam_frame(vm_offset_t pins)
+ 	}
+ 	/* the sensor's mode */
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
++	/* 0446: the table's PLL (0x0306 = 180, /6 at 0x0304) assumes a 24 MHz MCLK; ours is 26 MHz (OSCCLK only): 166 keeps
++	 * the lane rate (26 / 6 x 166 = 719 MHz, 24 / 6 x 180 = 720). cam-5 at 180: ECC, ID, lost FS/FE errors. */
++	uint32_t pll = 166, settle = 22;
++	PE_parse_boot_argn("notefe_cam_pll", &pll, sizeof(pll));
++	PE_parse_boot_argn("notefe_cam_settle", &settle, sizeof(settle));
+ 	for (unsigned i = 0; i < sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0]); i++) {
+-		bad += !nc_sensor_write(0x35, nc_4e6_mode[i].reg, nc_4e6_mode[i].val, nc_4e6_mode[i].bits);
++		uint16_t v = nc_4e6_mode[i].reg == 0x0306 ? (uint16_t)pll : nc_4e6_mode[i].val;
++		bad += !nc_sensor_write(0x35, nc_4e6_mode[i].reg, v, nc_4e6_mode[i].bits);
+ 	}
+-	printf("NOTEFE CAM: frame: sensor mode written (%u writes, %u not acknowledged); read back: output %u x %u, line %u, "
+-	    "frame %u lines, PLL %u/%u\n", (unsigned)(sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0])), bad, nc_sensor_rd16(0x034c),
++	printf("NOTEFE CAM: frame: settle %u; sensor mode written (%u writes, %u not acknowledged); read back: output %u x %u, "
++	    "line %u, frame %u lines, PLL %u/%u\n", settle, (unsigned)(sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0])), bad, nc_sensor_rd16(0x034c),
+ 	    nc_sensor_rd16(0x034e), nc_sensor_rd16(0x0342), nc_sensor_rd16(0x0340), nc_sensor_rd16(0x0306), nc_sensor_rd16(0x0304));
+ 	/* the receiver */
+ 	notefe_wr(mmu, 0, 0);
+@@ -2408,7 +2419,7 @@ notefe_cam_frame(vm_offset_t pins)
+ 	for (unsigned vc = 0; vc < 4; vc++) {
+ 		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
+ 	}
+-	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | (22u << 24) | (3u << 1));
++	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xff) << 24) | (3u << 1));
+ 	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (1u << 8));
+ 	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
+ 	notefe_wr(csis, 0x44, (NC_H << 16) | NC_W);

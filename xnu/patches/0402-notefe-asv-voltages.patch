@@ -1,0 +1,54 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: this chip's ASV voltages for the Mongoose and G3D rates
+
+The herolte tables hold the S7 maintainer's chip (ASV group 11). Samsung's own
+Linux on this Note FE (TWRP: mp-cpufreq cluster1_volt_table, Mali asv_table,
+phone-info/cpu-tables.txt, 2026-11-10) asks for more:
+
+  Mongoose 1976 MHz  943.75 mV (was 912.5)
+           2288 MHz  1025 mV   (was 993.75)  <- the rate in daily use
+           2600 MHz  1112.5 mV (was 1075)
+  G3D       419 MHz  625 mV    (was 612.5; 390 takes it too)
+            546 MHz  675 mV    (was 662.5)
+            600 MHz  693.75 mV (was 681.25)
+            650 MHz  712.5 mV  (was 700)     <- the rate in daily use
+
+The first boot ran 31 mV under this chip's table on the big cores and 12.5 mV
+under on the GPU (pthread corruption seen in healthd).
+---
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 96eb132..6029607 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -422,12 +422,12 @@ hg_clock_set(void)
+ 		uint32_t mhz, m, s;
+ 		uint8_t volt;
+ 	} rates[] = {
+-		{ 338, 208, 2, 0x30 },  /* 600 mV */
+-		{ 390, 240, 2, 0x32 },  /* the 612.5 mV of 419: between the table's rates, the higher one */
+-		{ 419, 258, 2, 0x32 },  /* 612.5 mV */
+-		{ 546, 168, 1, 0x3a },  /* 662.5 mV */
+-		{ 600, 185, 1, 0x3d },  /* 681.25 mV */
+-		{ 650, 200, 1, 0x40 },  /* 700 mV */
++		{ 338, 208, 2, 0x30 },  /* 600 mV (Note FE ASV: 600) */
++		{ 390, 240, 2, 0x34 },  /* Note FE: the 625 mV of 419, the next rate up */
++		{ 419, 258, 2, 0x34 },  /* Note FE ASV 625 mV (S7: 612.5) */
++		{ 546, 168, 1, 0x3c },  /* Note FE ASV 675 mV (S7: 662.5) */
++		{ 600, 185, 1, 0x3f },  /* Note FE ASV 693.75 mV (S7: 681.25) */
++		{ 650, 200, 1, 0x42 },  /* Note FE ASV 712.5 mV (S7: 700) */
+ 	};
+ 	uint32_t mhz = 0, m = 0, s = 2;
+ 	uint8_t volt = 0, now = 0;
+@@ -2302,9 +2302,9 @@ hg_cpu_up(void)
+ 		uint32_t mhz, m;
+ 		uint8_t volt, promise;
+ 	} rates[] = {
+-		{ 1976, 228, 0x62, 5 }, /* 912.5 mV */
+-		{ 2288, 264, 0x6f, 6 }, /* 993.75 mV, Samsung's boot rate */
+-		{ 2600, 300, 0x7c, 7 }, /* 1075 mV */
++		{ 1976, 228, 0x67, 5 }, /* Note FE ASV 943.75 mV (S7: 912.5) */
++		{ 2288, 264, 0x74, 6 }, /* Note FE ASV 1025 mV (S7: 993.75), Samsung's boot rate */
++		{ 2600, 300, 0x82, 7 }, /* Note FE ASV 1112.5 mV (S7: 1075) */
+ 	};
+ 	static bool done;
+ 	uint32_t mhz = 0, target_m = 0;

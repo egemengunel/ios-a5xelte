@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 1013809..cdbc20d 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3688,8 +3688,14 @@ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ 		if (zc_g1 == 0) {
+ 			zc_g1 = ml_io_map(HG_IDMA_G1_PA, 0x1000);
+ 		}
+-		if (zc_g1 != 0 && !(hg_rd(zc_g1, 0x1c) & 1)) {
+-			hg_wr(zc_g1, 0x1c, 1);
++		/*
++		 * (0430) G1's update did not do it either (boot 27). Samsung's command-mode update: the window's shadow update
++		 * request (decon_reg_update_req_window) with the hardware trigger unmasked; the DECON sends the frame at the
++		 * panel's next TE and clears the request. Not taken in 100 ms: window 0 back to G1, the copy for this boot.
++		 */
++		if (zc_on_window) {
++			hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++			hg_wr(zc_decon, 0x70, hg_rd(zc_decon, 0x70) & ~(1u << 5));
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		zc_window_locked();
+@@ -3701,6 +3707,26 @@ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ 		while (hg_rd(zc_vgr, 0xb74) != (uint32_t)pa && mach_absolute_time() - t0 < limit) {
+ 			delay(50);
+ 		}
++		if (zc_on_window && (hg_rd(zc_decon, 0x60) & 1u)) {
++			uint64_t t1 = mach_absolute_time(), lim2;
++			nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &lim2);
++			while ((hg_rd(zc_decon, 0x60) & 1u) && mach_absolute_time() - t1 < lim2) {
++				delay(100);
++			}
++			if (hg_rd(zc_decon, 0x60) & 1u) {
++				printf("NOTEFE ZC: window update not taken in 100 ms (update %#x trigger %#x line %#x): G1 and the copy "
++				    "for this boot\n", hg_rd(zc_decon, 0x60), hg_rd(zc_decon, 0x70), hg_rd(zc_decon, 0x8c));
++				hg_wr(zc_decon, 0x130, zc_win0);
++				hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++				if (zc_g1 != 0) {
++					hg_wr(zc_g1, 0x1c, 1);
++				}
++				zc_on_window = false;
++				zc_state = -1;
++				lck_mtx_unlock(hg_mtx);
++				return false;
++			}
++		}
+ 		zc_late += hg_rd(zc_vgr, 0xb74) != (uint32_t)pa;
+ 		zc_wait_abs += mach_absolute_time() - t0;
+ 		if (zc_flips < 5) {

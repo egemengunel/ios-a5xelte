@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index b2bb471..35444bb 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -486,6 +486,7 @@ notefe_brightness_sysctl SYSCTL_HANDLER_ARGS
+  * when both of its clocks read as on (a gated block can stop the bus). Nothing is written. Klog `NOTEFE BT:`.
+  */
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ static int notefe_bt_last;
+ 
+ static uint32_t
+@@ -2365,6 +2366,64 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
+ }
+ 
++/*
++ * Note FE (0450): the last frame, binned for the Mac: every other 2x2 Bayer cell of the 2608 x 1960 16-bit frame at
++ * 0xd0800000, so 1304 x 980 with the Bayer pattern kept, 8 bits (value >> 2). Read in 1 MB pieces mapped one at a
++ * time (ml_io_map's submap is 8 MB). sysctl kern.notefe_cam_pic (root) hands it out; the bot writes it to the drop zone.
++ */
++#define NC_PW   (NC_W / 2)
++#define NC_PH   (NC_H / 2)
++static uint8_t *nc_pic;
++
++static void
++nc_make_picture(void)
++{
++	if (!nc_pic) {
++		nc_pic = kalloc_data(NC_PW * NC_PH, Z_WAITOK);
++	}
++	if (!nc_pic) {
++		return;
++	}
++	const uint32_t row = NC_W * 2, rows_per = 0x100000 / row;           /* bytes a row, rows a piece */
++	for (uint32_t y0 = 0; y0 < NC_H; y0 += rows_per) {
++		uint32_t n = MIN(rows_per, NC_H - y0);
++		vm_offset_t m = ml_io_map(NC_BUF + y0 * row, n * row);
++		if (!m) {
++			printf("NOTEFE CAM: picture: map at row %u failed\n", y0);
++			return;
++		}
++		for (uint32_t y = y0; y < y0 + n; y++) {
++			if ((y & 3) >= 2) {
++				continue;                   /* rows 0,1 of every 4: one 2x2 cell row in two */
++			}
++			volatile uint16_t *src = (volatile uint16_t *)(m + (y - y0) * row);
++			uint8_t *dst = nc_pic + ((y >> 2) * 2 + (y & 1)) * NC_PW;
++			for (uint32_t x = 0; x < NC_W; x += 4) {
++				dst[x / 2] = (uint8_t)((src[x] & 0x3ff) >> 2);
++				dst[x / 2 + 1] = (uint8_t)((src[x + 1] & 0x3ff) >> 2);
++			}
++		}
++		ml_io_unmap(m, n * row);
++	}
++	printf("NOTEFE CAM: picture: %u x %u Bayer, 8 bits, ready (kern.notefe_cam_pic)\n", NC_PW, NC_PH);
++}
++
++static int
++notefe_cam_pic_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (!nc_pic) {
++		return ENOENT;
++	}
++	return SYSCTL_OUT(req, nc_pic, NC_PW * NC_PH);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, notefe_cam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, notefe_cam_pic_sysctl, "S", "Note FE: the front camera's last frame, 1304x980 Bayer 8-bit");
++
+ static void
+ notefe_cam_frame(vm_offset_t pins)
+ {
+@@ -2501,8 +2560,35 @@ notefe_cam_frame(vm_offset_t pins)
+ 	nc_csis_report(csis, mmu, "after 500 ms");
+ 	delay(1000000);
+ 	nc_csis_report(csis, mmu, "after 1.5 s");
++	/* 0450: a crude auto-exposure on the +6 MB window (the frame's middle rows; the DMA rewrites the same buffer every
++	 * frame): the mean above black (64) aimed at 18 % of 959; exposure 0x0202 (lines, up to frame - 4 = 2036) first,
++	 * then analogue gain 0x0204 (0x20 = 1x .. 0x200 = 16x), under the grouped hold 0x0104. Six steps, 200 ms each. */
++	uint32_t exp_l = 0x3fc, gain = 0x20;
++	for (unsigned step = 0; step < 6; step++) {
++		uint64_t sum = 0;
++		volatile uint16_t *px = (volatile uint16_t *)win[1];
++		for (uint32_t i = 0; i < 0x20000; i += 8) {
++			sum += px[i] & 0x3ff;
++		}
++		uint32_t mean = (uint32_t)(sum / (0x20000 / 8)), above = mean > 64 ? mean - 64 : 0;
++		uint32_t want = 172;
++		printf("NOTEFE CAM: ae step %u: mean %u (above black %u), exposure %u lines, gain %#x\n", step, mean, above, exp_l, gain);
++		if (above > want * 8 / 10 && above < want * 12 / 10) {
++			break;
++		}
++		uint32_t f = above ? (want * 256) / above : 256 * 16;       /* x256 */
++		uint64_t total = (uint64_t)exp_l * gain * f / 256;
++		exp_l = (uint32_t)MIN(MAX(total / gain, 4), 2036);
++		gain = (uint32_t)MIN(MAX(total / exp_l, 0x20), 0x200);
++		nc_sensor_write(0x35, 0x0104, 1, 8);
++		nc_sensor_write(0x35, 0x0202, (uint16_t)exp_l, 16);
++		nc_sensor_write(0x35, 0x0204, (uint16_t)gain, 16);
++		nc_sensor_write(0x35, 0x0104, 0, 8);
++		delay(200000);
++	}
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	delay(50000);
++	nc_make_picture();
+ 	/* receiver down, as found */
+ 	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);

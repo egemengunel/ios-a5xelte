@@ -1,0 +1,64 @@
+--- a/hero-run.c	2026-11-14 23:39:55
++++ b/hero-run.c	2026-11-14 23:39:55
+@@ -384,6 +384,21 @@
+  * next boot on. DROP_DIR disabled.list, one job a line, adds to them with no new build: 41 at once left SpringBoard
+  * waiting for ever behind a black screen, so which ones are safe is found by trying.
+  */
++/* Is NAME one of the lines of LIST? */
++static int
++job_listed(const char *list, const char *name)
++{
++   size_t n = strlen(name);
++   for (const char *t = list; *t;) {
++      size_t len = strcspn(t, " \t\r\n");
++      if (len == n && strncmp(t, name, n) == 0)
++         return 1;
++      t += len;
++      t += strspn(t, " \t\r\n");
++   }
++   return 0;
++}
++
+ static void
+ disable_refused_jobs(void)
+ {
+@@ -391,7 +406,16 @@
+       "com.apple.bluetoothd", "com.apple.ReportCrash", "com.apple.analyticsd", "com.apple.aggregated",
+       "com.apple.homed", "com.apple.cloudd", "com.apple.searchd", "com.apple.voicemail.vmd",
+    };
+-   size_t count = sizeof(jobs) / sizeof(jobs[0]);
++   size_t count = 0;
++   /* Note FE: DROP_DIR enabled.list, one job a line, keeps those jobs off the list (bluetoothd once the kernel has a
++      Bluetooth transport). write-drop.sh writes it on every run, empty by default. */
++   char keep[1024] = "";
++   FILE *kf = fopen(DROP_DIR "enabled.list", "r");
++   if (kf) {
++      size_t n = fread(keep, 1, sizeof(keep) - 1, kf);
++      keep[n] = 0;
++      fclose(kf);
++   }
+    mkdir("/private/var/db/com.apple.xpc.launchd", 0755);
+    FILE *f = fopen("/private/var/db/com.apple.xpc.launchd/disabled.plist", "w");
+    if (!f) {
+@@ -399,13 +423,19 @@
+       return;
+    }
+    fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n", f);
+-   for (size_t i = 0; i < count; i++)
++   for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]); i++) {
++      if (job_listed(keep, jobs[i])) {
++         herodrm_log("hero-run: %s left enabled (enabled.list)", jobs[i]);
++         continue;
++      }
+       fprintf(f, "\t<key>%s</key>\n\t<true/>\n", jobs[i]);
++      count++;
++   }
+    FILE *extra = fopen(DROP_DIR "disabled.list", "r");
+    char job[256];
+    while (extra && fgets(job, sizeof(job), extra)) {
+       job[strcspn(job, " \t\r\n")] = 0;
+-      if (job[0] && job[0] != '#') {
++      if (job[0] && job[0] != '#' && !job_listed(keep, job)) {
+          fprintf(f, "\t<key>%s</key>\n\t<true/>\n", job);
+          count++;
+       }

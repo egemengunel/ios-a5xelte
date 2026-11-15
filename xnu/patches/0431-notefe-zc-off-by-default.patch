@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index cdbc20d..b441ab9 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3581,7 +3581,7 @@ static bool
+ zc_setup_locked(uint32_t bpr, uint32_t w, uint32_t h)
+ {
+ 	if (zc_state == 0) {
+-		uint32_t on = 1;
++		uint32_t on = 0;        /* (0431) off by default: the panel froze (boots 23-28) */
+ 		PE_parse_boot_argn("notefe_zc", &on, sizeof(on));
+ 		zc_state = -1;
+ 		zc_vgr = on ? ml_io_map(0x13e03000u, 0x1000) : 0;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d31f0fa..08609c3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,7 +92,7 @@ extern "C" uint64_t
+ notefe_zc_pool_take(uint32_t w, uint32_t h, uint32_t fmt, uint32_t planes, uint32_t size)
+ {
+ 	if (notefe_zc_pool_on < 0) {
+-		uint32_t on = 1;
++		uint32_t on = 0;        /* (0431) off by default: the panel froze (boots 23-28) */
+ 		PE_parse_boot_argn("notefe_zc", &on, sizeof(on));
+ 		notefe_zc_pool_on = on ? 1 : 0;
+ 	}

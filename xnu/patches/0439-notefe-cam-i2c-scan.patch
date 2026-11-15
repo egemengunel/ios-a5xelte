@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 2050d82..9a572c9 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1907,8 +1907,7 @@ notefe_cam_probe(int level)
+  * 16 bits, 16-bit register addresses), 0x0002 (revision), 0x0005 (frame count). Power-down: the reverse, each LDO's
+  * voltage bits kept as found, enable bit off.
+  */
+-#define NC_SDA  2
+-#define NC_SCL  3
++static unsigned NC_SDA = 2, NC_SCL = 3;      /* 0439: swapped too in the scan */
+ static vm_offset_t nc_pins;
+ 
+ static void
+@@ -2022,18 +2021,49 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	delay(5000);
+ 	printf("NOTEFE CAM: front: reset high, MCLK on (gpk0 con %#x); the lines idle SDA %u SCL %u\n", notefe_rd(pins, 0x180),
+ 	    nc_sda(), (notefe_rd(pins, 0x144) >> NC_SCL) & 1);
+-	static const uint8_t addrs[] = { 0x35, 0x10, 0x2d, 0x36 };
+-	for (unsigned a = 0; a < sizeof(addrs); a++) {
+-		uint8_t id[2] = { 0, 0 }, rev = 0, fc = 0;
+-		if (nc_sensor_read(addrs[a], 0x0000, id, 2)) {
+-			nc_sensor_read(addrs[a], 0x0002, &rev, 1);
+-			nc_sensor_read(addrs[a], 0x0005, &fc, 1);
+-			printf("NOTEFE CAM: front: THE SENSOR ANSWERS at %#x: model ID %#06x, revision %#x, frame count %#x\n",
+-			    addrs[a], id[0] << 8 | id[1], rev, fc);
+-			break;
++	/* 0439: each line driven low and read back (is the pin ours, is it pulled up), then every address in both orders */
++	for (unsigned pin = 2; pin <= 3; pin++) {
++		nc_line(pin, 0);
++		unsigned low = (notefe_rd(pins, 0x144) >> pin) & 1;
++		nc_line(pin, 1);
++		delay(50);
++		printf("NOTEFE CAM: front: gpc2-%u driven low reads %u, released reads %u\n", pin, low,
++		    (notefe_rd(pins, 0x144) >> pin) & 1);
++	}
++	delay(20000);
++	for (unsigned order = 0; order < 2; order++) {
++		NC_SDA = order ? 3 : 2;
++		NC_SCL = order ? 2 : 3;
++		char found[160];
++		int o = 0;
++		found[0] = 0;
++		for (unsigned a = 0x08; a < 0x78; a++) {
++			nc_start();
++			bool ack = nc_byte_out((uint8_t)(a << 1 | 1));
++			if (ack) {
++				(void)nc_byte_in(false);
++			}
++			nc_stop();
++			if (ack && o < (int)sizeof(found) - 8) {
++				o += snprintf(found + o, sizeof(found) - (size_t)o, " %#x", a);
++			}
++		}
++		printf("NOTEFE CAM: front: scan with SDA gpc2-%u SCL gpc2-%u: answers at:%s\n", NC_SDA, NC_SCL, o ? found : " none");
++		static const uint8_t addrs[] = { 0x35, 0x6a, 0x10, 0x2d, 0x36 };
++		for (unsigned a = 0; a < sizeof(addrs); a++) {
++			uint8_t id[2] = { 0, 0 }, rev = 0, fc = 0;
++			if (nc_sensor_read(addrs[a], 0x0000, id, 2)) {
++				nc_sensor_read(addrs[a], 0x0002, &rev, 1);
++				nc_sensor_read(addrs[a], 0x0005, &fc, 1);
++				printf("NOTEFE CAM: front: THE SENSOR ANSWERS at %#x: model ID %#06x, revision %#x, frame count %#x\n",
++				    addrs[a], id[0] << 8 | id[1], rev, fc);
++				order = 2;
++				break;
++			}
+ 		}
+-		printf("NOTEFE CAM: front: no answer at %#x\n", addrs[a]);
+ 	}
++	NC_SDA = 2;
++	NC_SCL = 3;
+ 	/* down again, the reverse */
+ 	notefe_pin(pins, 0x180, 2, 0, -1, -1);
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 0);

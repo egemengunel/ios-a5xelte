@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 8908d48..4c01462 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2450,10 +2450,15 @@ notefe_cam_frame(vm_offset_t pins)
+ 	nc_sensor_write(0x35, 0x0100, 1, 8);
+ 	if (notefe_cam_last == 6) {
+ 		/* 0447: settle sweep, the sensor streaming throughout: 300 ms a value (about 9 of its frames) */
+-		static const uint8_t settles[] = { 6, 10, 14, 18, 22, 26, 30, 34, 40, 48 };
++		static const uint8_t settles[] = { 4, 8, 12, 16, 20, 22, 24, 28, 32, 40 };
+ 		uint32_t best = settle, best_err = 0xffffffffu;
+ 		for (unsigned i = 0; i < sizeof(settles); i++) {
++			/* 0448: the sensor off around each setup, so the lanes go LP -> HS again (cam-6: a reset mid-stream left
++			 * the receiver with nothing) */
++			nc_sensor_write(0x35, 0x0100, 0, 8);
++			delay(60000);
+ 			nc_csis_setup(csis, settles[i]);
++			nc_sensor_write(0x35, 0x0100, 1, 8);
+ 			delay(300000);
+ 			uint32_t s0 = notefe_rd(csis, 0x14), s1 = notefe_rd(csis, 0x1c), fr = notefe_rd(csis, 0x100);
+ 			uint32_t errs = ((s0 >> 12) & 1) + ((s0 >> 8) & 1) + ((s0 >> 2) & 1) + ((s0 >> 1) & 1) + (s0 & 1) + ((s0 >> 16) & 1);
+@@ -2466,12 +2471,15 @@ notefe_cam_frame(vm_offset_t pins)
+ 		}
+ 		printf("NOTEFE CAM: sweep: best settle %u (%u error kinds)\n", best, best_err);
+ 		settle = best;
++		nc_sensor_write(0x35, 0x0100, 0, 8);
++		delay(60000);
+ 		for (unsigned i = 0; i < 3; i++) {
+ 			for (uint32_t o = 0; o < 0x40000; o += 4) {
+ 				*(volatile uint32_t *)(win[i] + o) = 0xa5a5a5a5u;
+ 			}
+ 		}
+ 		nc_csis_setup(csis, settle);
++		nc_sensor_write(0x35, 0x0100, 1, 8);
+ 	}
+ 	delay(100000);
+ 	nc_csis_report(csis, mmu, "after 100 ms");

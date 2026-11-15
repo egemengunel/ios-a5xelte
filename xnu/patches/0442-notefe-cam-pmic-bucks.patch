@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index ba9dae4..7ada91d 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2001,6 +2001,29 @@ notefe_cam_front_id(vm_offset_t pins)
+ 		return;
+ 	}
+ 	printf("NOTEFE CAM: front: LDO5 %#x LDO6 %#x LDO13 %#x as found; gpc2 con %#x\n", l5, l6, l13, notefe_rd(pins, 0x140));
++	/* 0442: BUCK1 (VDD_1P3_EXT, 1.3 V) and the buck-boost BB (2.6-4.0 V) are "always-on, boot-on" in the DTB: Linux keeps
++	 * them on, nothing does under iOS, and the LDOs are made from them (the S9's lesson: BUCK2 there). Enable = bits 7:6
++	 * of B1CTRL1 0x0b / BB1CTRL1 0x0f (mask 0xc0); BUCK1's voltage B1CTRL2 0x0c = 400 mV + 6.25 mV n (1.3 V = 0x90);
++	 * BB's BB1CTRL2 0x10 = 2.6 V + 12.5 mV n, used as found if in 2.6-4.0 V. Put back as found at the end. */
++	uint8_t b1[2] = { 0, 0 }, bb[2] = { 0, 0 };
++	nc_read(0x59, 0x0b, b1, 2);
++	nc_read(0x59, 0x0f, bb, 2);
++	printf("NOTEFE CAM: front: BUCK1 ctrl %#x volt %#x, BB ctrl %#x volt %#x (about %u mV) as found\n", b1[0], b1[1], bb[0], bb[1],
++	    2600 + (bb[1] & 0x7f) * 25 / 2);
++	bool b1_on = false, bb_on = false;
++	if ((b1[0] & 0xc0) != 0xc0) {
++		b1_on = nc_pmic_write(0x0c, 0x90) && nc_pmic_write(0x0b, (uint8_t)(b1[0] | 0xc0));
++		delay(200);
++	}
++	if ((bb[0] & 0xc0) != 0xc0 && 2600 + (bb[1] & 0x7f) * 25 / 2 <= 4000) {
++		bb_on = nc_pmic_write(0x0f, (uint8_t)(bb[0] | 0xc0));
++		delay(200);
++	}
++	uint8_t c1[2] = { 0, 0 }, cb[2] = { 0, 0 };
++	nc_read(0x59, 0x0b, c1, 2);
++	nc_read(0x59, 0x0f, cb, 2);
++	printf("NOTEFE CAM: front: BUCK1 %s (ctrl %#x volt %#x), BB %s (ctrl %#x volt %#x)\n", b1_on ? "switched ON" : "left",
++	    c1[0], c1[1], bb_on ? "switched ON" : "left", cb[0], cb[1]);
+ 	notefe_pin(pins, 0x120, 1, 1, 0, 0);            /* standby low */
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 0);            /* reset low */
+ 	nc_line(NC_SDA, 1);
+@@ -2091,6 +2114,13 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	nc_read(0x59, 0x2a, &r13, 1);
+ 	notefe_pin(pins, 0x140, NC_SDA, 0, -1, -1);
+ 	notefe_pin(pins, 0x140, NC_SCL, 0, -1, -1);
++	if (bb_on) {
++		nc_pmic_write(0x0f, bb[0]);
++	}
++	if (b1_on) {
++		nc_pmic_write(0x0b, b1[0]);
++		nc_pmic_write(0x0c, b1[1]);
++	}
+ 	printf("NOTEFE CAM: front: powered down: LDO5 %#x LDO6 %#x LDO13 %#x\n", r5, r6, r13);
+ }
+ 

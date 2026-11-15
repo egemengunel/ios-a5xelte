@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2083574..573c379 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -246,7 +246,7 @@ notefe_range(uint32_t value)
+ static void
+ notefe_backlight_publish(IOService *display)
+ {
+-	uint32_t on = 0;
++	uint32_t on = 1;        /* 0420: on by default (the slider works, boot 16); notefe_bl=0: none */
+ 	PE_parse_boot_argn("notefe_bl", &on, sizeof(on));
+ 	if (!on) {
+ 		return;
+@@ -287,8 +287,27 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 		v = OSDynamicCast(OSNumber, dict->getObject("brightness"));
+ 	}
+ 	if (v) {
++		/* Note FE (0420): CoreBrightness sends linear light (an LCD backlight's level, 65536 = full; the slider at
++		 * half is 32768). Scaled pixels give light as about the value^2.2 on this AMOLED, so the pixel factor is
++		 * about the square root of the level: half the slider is 181 of 255, not a dim 127 (boot 16). */
+ 		uint64_t x = v->unsigned64BitValue();
+-		notefe_brightness_set((uint32_t)(x >= 65536 ? 255 : x * 255 / 65536), "backlight");
++		if (x > 65536) {
++			x = 65536;
++		}
++		uint64_t r;                             /* integer square root of x * 65536 (0..65536) */
++		{
++			uint64_t n = x * 65536, lo = 0, hi = 65536;
++			while (lo < hi) {
++				uint64_t mid = (lo + hi + 1) / 2;
++				if (mid * mid <= n) {
++					lo = mid;
++				} else {
++					hi = mid - 1;
++				}
++			}
++			r = lo;
++		}
++		notefe_brightness_set((uint32_t)(r >= 65536 ? 255 : r * 255 / 65536), "backlight");
+ 	}
+ 	return kIOReturnSuccess;
+ }

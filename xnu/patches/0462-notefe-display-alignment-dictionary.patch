@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8415ee0..627eb0c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -573,7 +573,19 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/* Note FE (0462): a dictionary, as iOS 16's readers want it (VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
++	 * and QuartzCore both look up PlaneBaseAlignmentLinear in it); the bare number made mediaserverd throw
++	 * -[__NSCFNumber objectForKey:] when Camera.app's preview pipeline was built (cam-app5/6). */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (align && linear) {
++			align->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	/* Note FE (0419): no "backlight-control" here any more. On the display itself it sent CoreBrightness down the
+ 	 * OLED path and backboardd stalled (boot 14). The backlight is a child service now (AppleARMBacklight, below). */
+ 	registerService();

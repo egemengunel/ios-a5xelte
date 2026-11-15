@@ -1,0 +1,75 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: Sandbox stand-in issues and consumes extensions (tccd's grants reach assetsd)
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 10e01a9..1293a4f 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -287,7 +287,7 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+ static uint64_t sweet_sandbox_seen;
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,6 +295,58 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * Note FE 0410: sandbox extensions. tccd grants kTCCServicePhotos to assetsd by entitlement, then must issue the
++	 * matching sandbox extension (sandbox_extension_issue_generic); with ENOENT here it logged "Failed to issue Sandbox
++	 * Extension for kTCCServicePhotos" and assetsd aborted ("requires TCCPhotosService access"; boot 6 unified log).
++	 * Argument blocks (libsystem_sandbox, iOS 16.7.16): op 5 issue {class, type, path, flags, char *token (0x800),
++	 * pid, x}; op 6 consume {token, length + 1, int64_t *handle}; op 7 release {handle, 0, 0}. Nothing is enforced on this
++	 * port, so a token only has to look like one and be accepted back.
++	 */
++	if (call == 5) {
++		struct {
++			uint64_t class_ptr, type, path_ptr, flags, token_ptr, pid, extra;
++		} a;
++		char cls[128] = "", path[160] = "", token[400];
++		size_t done = 0;
++		static uint32_t issued;
++		if (copyin(arg, &a, sizeof(a)) != 0 || a.token_ptr == 0) {
++			return EFAULT;
++		}
++		if (a.class_ptr) {
++			(void)copyinstr((user_addr_t)a.class_ptr, cls, sizeof(cls), &done);
++		}
++		if (a.path_ptr) {
++			(void)copyinstr((user_addr_t)a.path_ptr, path, sizeof(path), &done);
++		}
++		uint32_t n = ++issued;
++		int len = snprintf(token, sizeof(token),
++		    "%016x%016x%08x;00;00000000;00000000;00000000;%016llx;%s;%08x;%s",
++		    0x4e4f5445u /* NOTE */, n, n, (unsigned long long)a.type, cls[0] ? cls : "-", n, path);
++		if (n <= 40) {
++			char who[32];
++			proc_name(proc_pid(p), who, sizeof(who));
++			printf("NOTEFE SANDBOX: %s issues extension %u: class %s type %llu path %s\n", who, n,
++			    cls[0] ? cls : "-", (unsigned long long)a.type, path[0] ? path : "-");
++		}
++		return copyout(token, (user_addr_t)a.token_ptr, (size_t)len + 1);
++	}
++	if (call == 6) {
++		struct {
++			uint64_t token_ptr, length, handle_ptr;
++		} a;
++		static int64_t handles;
++		if (copyin(arg, &a, sizeof(a)) != 0 || a.handle_ptr == 0) {
++			return EFAULT;
++		}
++		int64_t h = ++handles;          /* a race only repeats a number; nothing is checked */
++		return copyout(&h, (user_addr_t)a.handle_ptr, sizeof(h));
++	}
++	if (call == 7) {
++		return 0;
++	}
++#endif
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */

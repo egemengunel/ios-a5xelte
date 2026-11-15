@@ -1,0 +1,250 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index f75f090..5afd55d 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -23,6 +23,8 @@
+ #include <sys/sysctl.h>
+ #include <sys/kauth.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+@@ -500,6 +502,208 @@ notefe_bt_bank(const char *name, vm_offset_t base, uint32_t off, unsigned pin)
+ 	    (con >> (4 * pin)) & 0xf, (dat >> pin) & 1, (pud >> (4 * pin)) & 0xf);
+ }
+ 
++/*
++ * Note FE (0433): Bluetooth steps 2 and 3, on `sysctl kern.notefe_bt=3..5` (root). The writes are UART1's own registers,
++ * the four UART pins and the chip's BT_WAKE / BT_REG_ON pins (read-modify-write of the one pin's fields each).
++ *   3  UART1 up: its clock rate worked out from BUS0_PLL (PLL_CON0 M/P/S from the 26 MHz crystal, the TOP muxes, the
++ *      UART1 divider), gpe0-0..3 to function 2 with pull-up (the DTB's "btdefault"), 115200 8N1 by polling (UBRDIV
++ *      div/16-1, UFRACVAL div&15, Samsung's samsung.c), every interrupt masked, and 16 bytes through the UART's own
++ *      loopback (UCON bit 5): no chip involved
++ *   4  ... the chip powered as Samsung's bcm43xx.c does: BT_WAKE (gpi2-3) output high, BT_REG_ON (gpj1-7) output low,
++ *      10 ms, high, 100 ms, then RTS/CTS flow control on (UMCON bit 4); what it sends by itself is logged
++ *   5  ... HCI over H4 at 115200: HCI_Reset, Read Local Version (Broadcom is manufacturer 0x000f), Read Local Name: the
++ *      chip's ROM answering. No firmware is sent yet.
++ * kern.notefe_bt=6 powers the chip off again (BT_REG_ON low).
++ */
++static uint64_t
++notefe_bt_rate(vm_offset_t top)
++{
++	uint32_t con0 = notefe_rd(top, 0x100), m = (con0 >> 16) & 0x3ff, pdiv = (con0 >> 8) & 0x3f, sdiv = con0 & 7;
++	uint64_t pll = pdiv ? 26000000ull * m / ((uint64_t)pdiv << sdiv) : 0;
++	uint64_t r = (notefe_rd(top, 0x200) >> 12) & 1 ? pll : 26000000ull;          /* TOP_MUX_BUS0_PLL: OSC or the PLL */
++	if ((notefe_rd(top, 0x220) >> 12) & 1) {                                     /* TOP_MUX_SCLK_BUS0_PLL: /2 */
++		r /= 2;
++	}
++	uint32_t sel = (notefe_rd(top, 0x354) >> 12) & 3;                            /* 0 BUS0, 1 BUS1, 2-3 OSC */
++	if (sel >= 2) {
++		r = 26000000ull;
++	} else if (sel == 1) {
++		r = 0;                                                               /* BUS1: not worked out here */
++	}
++	r /= (notefe_rd(top, 0x4b4) & 0xf) + 1;
++	printf("NOTEFE BT: BUS0_PLL con0 %#x (M %u P %u S %u) = %llu Hz; mux %#x sclk mux %#x uart1 sel %u -> %llu Hz\n",
++	    con0, m, pdiv, sdiv, pll, notefe_rd(top, 0x200), notefe_rd(top, 0x220), sel, r);
++	return r;
++}
++
++static void
++notefe_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static void
++notefe_pin(vm_offset_t base, uint32_t bank, unsigned pin, int func, int pud, int level)
++{
++	if (level >= 0) {
++		uint32_t dat = notefe_rd(base, bank + 4);
++		notefe_wr(base, bank + 4, level ? (dat | (1u << pin)) : (dat & ~(1u << pin)));
++	}
++	if (pud >= 0) {
++		uint32_t v = notefe_rd(base, bank + 8);
++		notefe_wr(base, bank + 8, (v & ~(0xfu << (4 * pin))) | ((uint32_t)pud << (4 * pin)));
++	}
++	if (func >= 0) {
++		uint32_t v = notefe_rd(base, bank);
++		notefe_wr(base, bank, (v & ~(0xfu << (4 * pin))) | ((uint32_t)func << (4 * pin)));
++	}
++}
++
++static unsigned
++notefe_uart_read(vm_offset_t uart, uint8_t *buf, unsigned max, unsigned wait_us, unsigned want)
++{
++	unsigned n = 0;
++	for (unsigned t = 0; t < wait_us && n < max; ) {
++		uint32_t st = notefe_rd(uart, 0x18);
++		if ((st & 0xff) || (st & (1u << 8))) {
++			buf[n++] = (uint8_t)notefe_rd(uart, 0x24);
++			if (want && n >= want) {
++				break;
++			}
++			continue;
++		}
++		delay(20);
++		t += 20;
++	}
++	return n;
++}
++
++static bool
++notefe_uart_write(vm_offset_t uart, const uint8_t *buf, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		unsigned t = 0;
++		while (notefe_rd(uart, 0x18) & (1u << 24)) {
++			if ((t += 10) > 100000) {
++				return false;
++			}
++			delay(10);
++		}
++		notefe_wr(uart, 0x20, buf[i]);
++	}
++	return true;
++}
++
++static void
++notefe_hex(const char *what, const uint8_t *b, unsigned n)
++{
++	char line[3 * 48 + 1];
++	unsigned k = 0;
++	for (unsigned i = 0; i < n && i < 48; i++) {
++		static const char hx[] = "0123456789abcdef";
++		line[k++] = hx[b[i] >> 4];
++		line[k++] = hx[b[i] & 15];
++		line[k++] = ' ';
++	}
++	line[k] = 0;
++	printf("NOTEFE BT: %s (%u bytes): %s%s\n", what, n, line, n > 48 ? "..." : "");
++}
++
++/* One HCI command, its Command Complete back (event 0x0e for this opcode); returns the event's length or 0. */
++static unsigned
++notefe_hci(vm_offset_t uart, uint16_t opcode, uint8_t *ev, unsigned max)
++{
++	uint8_t cmd[4] = { 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0 };
++	if (!notefe_uart_write(uart, cmd, 4)) {
++		printf("NOTEFE BT: HCI %#06x: TX stuck (CTS low?)\n", opcode);
++		return 0;
++	}
++	unsigned n = notefe_uart_read(uart, ev, 3, 2000000, 3);
++	if (n == 3 && ev[0] == 0x04) {
++		n += notefe_uart_read(uart, ev + 3, MIN((unsigned)ev[2], max - 3), 500000, ev[2]);
++	}
++	char what[40];
++	snprintf(what, sizeof(what), "HCI %#06x ->", opcode);
++	notefe_hex(what, ev, n);
++	return n;
++}
++
++static void
++notefe_bt_up(int level, vm_offset_t top, vm_offset_t pins, vm_offset_t pins_i, vm_offset_t uart)
++{
++	if (level == 6) {
++		notefe_pin(pins, 0x60, 7, 1, -1, 0);
++		printf("NOTEFE BT: BT_REG_ON low (chip off)\n");
++		return;
++	}
++	uint64_t rate = notefe_bt_rate(top);
++	if (rate < 1843200 || rate > 1000000000ull) {
++		printf("NOTEFE BT: clock rate %llu Hz unusable, stopping\n", rate);
++		return;
++	}
++	for (unsigned pin = 0; pin < 4; pin++) {
++		notefe_pin(pins, 0x00, pin, 2, 3, -1);
++	}
++	notefe_wr(uart, 0x38, 0xf);                     /* UINTM: all masked */
++	notefe_wr(uart, 0x30, 0xf);                     /* UINTP: cleared */
++	notefe_wr(uart, 0x08, 0x7);                     /* UFCON: FIFO on, both reset */
++	delay(100);
++	notefe_wr(uart, 0x08, 0x1);
++	notefe_wr(uart, 0x00, 0x3);                     /* ULCON: 8N1 */
++	notefe_wr(uart, 0x0c, 0);                       /* UMCON: no flow control yet */
++	uint64_t div = rate / 115200;
++	notefe_wr(uart, 0x28, (uint32_t)(div / 16 - 1));
++	notefe_wr(uart, 0x2c, (uint32_t)(div & 15));
++	notefe_wr(uart, 0x04, 0x5 | (1u << 5));         /* UCON: RX/TX by the CPU, loopback */
++	printf("NOTEFE BT: uart1 115200 from %llu Hz: UBRDIV %u UFRACVAL %u\n", rate, (unsigned)(div / 16 - 1),
++	    (unsigned)(div & 15));
++	uint8_t out[16], in[64];
++	for (unsigned i = 0; i < 16; i++) {
++		out[i] = (uint8_t)(0xa5 ^ (i * 17));
++	}
++	bool tx = notefe_uart_write(uart, out, 16);
++	unsigned got = notefe_uart_read(uart, in, sizeof(in), 50000, 16);
++	printf("NOTEFE BT: loopback: tx %s, %u of 16 back, %s\n", tx ? "ok" : "stuck", got,
++	    got == 16 && !memcmp(in, out, 16) ? "MATCH" : "mismatch");
++	notefe_wr(uart, 0x04, 0x5);                     /* loopback off */
++	notefe_wr(uart, 0x08, 0x7);
++	delay(100);
++	notefe_wr(uart, 0x08, 0x1);
++	if (level < 4) {
++		return;
++	}
++	notefe_pin(pins_i, 0x20, 3, 1, -1, 1);          /* BT_WAKE output high */
++	notefe_pin(pins, 0x60, 7, 1, -1, 0);            /* BT_REG_ON output low */
++	delay(10000);
++	notefe_pin(pins, 0x60, 7, -1, -1, 1);           /* BT_REG_ON high */
++	delay(100000);
++	notefe_wr(uart, 0x0c, 1u << 4);                 /* UMCON: auto RTS/CTS */
++	printf("NOTEFE BT: chip powered: BT_REG_ON dat %#x, UMSTAT %#x (bit 0 = CTS)\n", notefe_rd(pins, 0x64),
++	    notefe_rd(uart, 0x1c));
++	got = notefe_uart_read(uart, in, sizeof(in), 200000, 0);
++	notefe_hex("chip said by itself", in, got);
++	if (level < 5) {
++		return;
++	}
++	uint8_t ev[260];
++	notefe_hci(uart, 0x0c03, ev, sizeof(ev));                       /* HCI_Reset */
++	unsigned n = notefe_hci(uart, 0x1001, ev, sizeof(ev));           /* Read Local Version */
++	if (n >= 15 && ev[1] == 0x0e) {
++		printf("NOTEFE BT: version: status %u hci %u rev %#x lmp %u manufacturer %#x lmp_sub %#x\n", ev[6], ev[7],
++		    ev[8] | ev[9] << 8, ev[10], ev[11] | ev[12] << 8, ev[13] | ev[14] << 8);
++	}
++	n = notefe_hci(uart, 0x0c14, ev, sizeof(ev));                    /* Read Local Name */
++	if (n > 7 && ev[1] == 0x0e) {
++		char name[64];
++		unsigned k = 0;
++		for (unsigned i = 7; i < n && k < sizeof(name) - 1 && ev[i]; i++) {
++			name[k++] = (ev[i] >= 32 && ev[i] < 127) ? (char)ev[i] : '?';
++		}
++		name[k] = 0;
++		printf("NOTEFE BT: local name \"%s\"\n", name);
++	}
++}
++
+ static void
+ notefe_bt_probe(int level)
+ {
+@@ -537,6 +741,9 @@ notefe_bt_probe(int level)
+ 		printf("NOTEFE BT: uart1 +%#04x: %#x %#x %#x %#x\n", o, notefe_rd(uart, o), notefe_rd(uart, o + 4),
+ 		    notefe_rd(uart, o + 8), notefe_rd(uart, o + 12));
+ 	}
++	if (level >= 3) {
++		notefe_bt_up(level, top, pins, pins_i, uart);
++	}
+ }
+ 
+ static int
+@@ -551,7 +758,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 2) {
++	if (value < 1 || value > 6) {
+ 		return EINVAL;
+ 	}
+ 	notefe_bt_last = value;
+@@ -560,7 +767,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth probe (1 clocks/pins, 2 + UART1 registers), read only");
++    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth (1-2 read only, 3 UART loopback, 4 chip power, 5 HCI version, 6 chip off)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

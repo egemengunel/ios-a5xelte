@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index f6c7a8b..8908d48 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1900,7 +1900,7 @@ notefe_cam_probe(int level)
+ 	if (level == 4) {
+ 		notefe_cam_csis_look();
+ 	}
+-	if (level == 5) {
++	if (level == 5 || level == 6) {
+ 		notefe_cam_frame(pins);
+ 	}
+ }
+@@ -2336,6 +2336,35 @@ nc_csis_report(vm_offset_t csis, vm_offset_t mmu, const char *when)
+ 	    notefe_rd(csis, 0x1040), notefe_rd(mmu, 8));
+ }
+ 
++/* 0447: CSIS2 reset and set up for the 4E6's mode at a given settle (Samsung's csi_stream_on order), then enabled */
++static void
++nc_csis_setup(vm_offset_t csis, uint32_t settle)
++{
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	for (unsigned n = 0; n < 100 && (notefe_rd(csis, 0x4) & 2u); n++) {
++		delay(10);
++	}
++	for (unsigned vc = 0; vc < 4; vc++) {
++		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
++	}
++	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xff) << 24) | (3u << 1));
++	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (1u << 8));
++	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
++	notefe_wr(csis, 0x44, (NC_H << 16) | NC_W);
++	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
++	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++		notefe_wr(csis, a, NC_BUF);
++	}
++	notefe_wr(csis, 0x1000, (notefe_rd(csis, 0x1000) & ~1u) | 2u);
++	notefe_wr(csis, 0x14, notefe_rd(csis, 0x14));
++	notefe_wr(csis, 0x1c, notefe_rd(csis, 0x1c));
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | (0xfu << 16));
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
++}
++
+ static void
+ notefe_cam_frame(vm_offset_t pins)
+ {
+@@ -2412,33 +2441,38 @@ notefe_cam_frame(vm_offset_t pins)
+ 	notefe_wr(pmu, 0x714, iso | 1);
+ 	notefe_wr(phy, 0x50, phyc & ~2u);
+ 	notefe_wr(phy, 0x50, phyc | 2u);
+-	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
+-	for (unsigned n = 0; n < 100 && (notefe_rd(csis, 0x4) & 2u); n++) {
+-		delay(10);
+-	}
+-	for (unsigned vc = 0; vc < 4; vc++) {
+-		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
+-	}
+-	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xff) << 24) | (3u << 1));
+-	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (1u << 8));
+-	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
+-	notefe_wr(csis, 0x44, (NC_H << 16) | NC_W);
+-	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
+-	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
+-		notefe_wr(csis, a, NC_BUF);
+-	}
+-	notefe_wr(csis, 0x1000, (notefe_rd(csis, 0x1000) & ~1u) | 2u);
+-	notefe_wr(csis, 0x14, notefe_rd(csis, 0x14));
+-	notefe_wr(csis, 0x1c, notefe_rd(csis, 0x1c));
+-	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | (0xfu << 16));
+-	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) | 1u);
+-	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
++	nc_csis_setup(csis, settle);
+ 	printf("NOTEFE CAM: frame: CSIS2 set: CMN %#x DPHY_CMN %#x CH0 %#x/%#x DMA0 ctrl %#x fmt %#x addr %#x; PHY %#x iso %#x; "
+ 	    "SysMMU ctrl %#x (was %#x)\n", notefe_rd(csis, 0x4), notefe_rd(csis, 0x24), notefe_rd(csis, 0x40), notefe_rd(csis, 0x44),
+ 	    notefe_rd(csis, 0x1000), notefe_rd(csis, 0x1004), notefe_rd(csis, 0x1010), notefe_rd(phy, 0x50),
+ 	    notefe_rd(pmu, 0x714), notefe_rd(mmu, 0), mmu_ctrl);
+ 	/* stream */
+ 	nc_sensor_write(0x35, 0x0100, 1, 8);
++	if (notefe_cam_last == 6) {
++		/* 0447: settle sweep, the sensor streaming throughout: 300 ms a value (about 9 of its frames) */
++		static const uint8_t settles[] = { 6, 10, 14, 18, 22, 26, 30, 34, 40, 48 };
++		uint32_t best = settle, best_err = 0xffffffffu;
++		for (unsigned i = 0; i < sizeof(settles); i++) {
++			nc_csis_setup(csis, settles[i]);
++			delay(300000);
++			uint32_t s0 = notefe_rd(csis, 0x14), s1 = notefe_rd(csis, 0x1c), fr = notefe_rd(csis, 0x100);
++			uint32_t errs = ((s0 >> 12) & 1) + ((s0 >> 8) & 1) + ((s0 >> 2) & 1) + ((s0 >> 1) & 1) + (s0 & 1) + ((s0 >> 16) & 1);
++			printf("NOTEFE CAM: sweep settle %u: frames %u, INT_SRC0 %#x (errors %u), INT_SRC1 %#x, DMA bytes %u, DPHY %#x\n",
++			    settles[i], fr, s0, errs, s1, notefe_rd(csis, 0x1040), notefe_rd(csis, 0x20));
++			if (errs < best_err || (errs == best_err && fr >= 5 && fr <= 15)) {
++				best_err = errs;
++				best = settles[i];
++			}
++		}
++		printf("NOTEFE CAM: sweep: best settle %u (%u error kinds)\n", best, best_err);
++		settle = best;
++		for (unsigned i = 0; i < 3; i++) {
++			for (uint32_t o = 0; o < 0x40000; o += 4) {
++				*(volatile uint32_t *)(win[i] + o) = 0xa5a5a5a5u;
++			}
++		}
++		nc_csis_setup(csis, settle);
++	}
+ 	delay(100000);
+ 	nc_csis_report(csis, mmu, "after 100 ms");
+ 	delay(400000);
+@@ -2498,7 +2532,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 5) {
++	if (value < 1 || value > 6) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
+@@ -2507,7 +2541,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID, 4 CSIS2 look, 5 one frame)");
++    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID, 4 CSIS2 look, 5 one frame, 6 + settle sweep)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

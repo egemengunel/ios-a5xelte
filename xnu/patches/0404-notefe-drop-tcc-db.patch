@@ -1,0 +1,63 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: drop zone may also write TCC.db (owned by mobile) and launchd.plist
+
+1. /private/var/mobile/Library/TCC/ files, chowned 501:501 like tccd's own:
+   assetsd aborts with "assetsd requires TCCPhotosService access" although its
+   signature has com.apple.private.tcc.allow = [kTCCServicePhotos]; a TCC.db
+   with the grant can be dropped from TWRP.
+2. /System/Library/xpc/launchd.plist (root:wheel): iOS 16 launchd ignores
+   hero-run's disabled.plist (disabled.migrated), so the jobs heronoexec refuses
+   are spawned again every ten seconds (about 80 failed spawns each per session)
+   and their clients wait for ever (Phone on vmd). A launchd.plist without those
+   jobs, made from the phone's own, removes them from the next boot on.
+---
+diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
+index d3e8ed8..d7f867a 100644
+--- a/bsd/dev/herolte_drop.c
++++ b/bsd/dev/herolte_drop.c
+@@ -40,6 +40,8 @@ void herolte_drop_apply(void);
+ #define HDROP_BLOCKS    (32768u)                /* 128 MiB */
+ #define HDROP_CHUNK     (256u * HDROP_BLOCK)    /* 1 MiB read at a time */
+ #define HDROP_PREFIX    "/private/var/herolte/"
++#define HDROP_TCC_PREFIX "/private/var/mobile/Library/TCC/"   /* Note FE 0404 */
++#define HDROP_LAUNCHD_PLIST "/System/Library/xpc/launchd.plist" /* Note FE 0404 */
+ #define HDROP_MAX_PATH  255u
+ 
+ struct hdrop_header {
+@@ -279,13 +281,35 @@ hdrop_install(void)
+ 		uint64_t data = off + ((sizeof(e) + e.path_len + 7) & ~7ull);
+ 		off = data + ((e.size + 7) & ~7ull);
+ 		int error;
+-		if (strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) != 0 || hdrop_has_dotdot(path)) {
++		/*
++		 * Note FE 0404: also /private/var/mobile/Library/TCC/ (files only, owned by mobile 501:501, as tccd keeps
++		 * TCC.db): a privacy database with grants that tccd does not make here (assetsd's kTCCServicePhotos).
++		 */
++		bool tcc = strncmp(path, HDROP_TCC_PREFIX, strlen(HDROP_TCC_PREFIX)) == 0 && e.mode != 0 &&
++		    strchr(path + strlen(HDROP_TCC_PREFIX), '/') == NULL;
++		/* ...and launchd's job list itself (root:wheel), to take out jobs heronoexec refuses: launchd retries those
++		 * every ten seconds and ignores hero-run's disabled.plist on iOS 16 (disabled.migrated). Next boot on. */
++		bool jobs = e.mode != 0 && strcmp(path, HDROP_LAUNCHD_PLIST) == 0;
++		if ((strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) != 0 && !tcc && !jobs) || hdrop_has_dotdot(path)) {
+ 			error = EPERM;
+ 		} else if (e.mode == 0) {
+ 			error = hdrop_mkdir(path, 0755, ctx);
+ 			error = error == EEXIST ? 0 : error;
+ 		} else {
+ 			error = hdrop_file(&r, path, (int)e.mode, data, e.size, ctx);
++			if (!error && tcc) {
++				vnode_t vp = NULLVP;
++				error = vnode_lookup(path, 0, &vp, ctx);
++				if (!error) {
++					struct vnode_attr va;
++					VATTR_INIT(&va);
++					VATTR_SET(&va, va_uid, 501);
++					VATTR_SET(&va, va_gid, 501);
++					error = vnode_setattr(vp, &va, ctx);
++					vnode_put(vp);
++				}
++				printf("HEROLTE DROP: %s for mobile: %d\n", path, error);
++			}
+ 		}
+ 		if (error) {
+ 			failed++;

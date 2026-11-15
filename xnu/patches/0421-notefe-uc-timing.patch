@@ -1,0 +1,129 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..ab5fd67 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -5002,6 +5002,92 @@ is_io_connect_method_var_output
+ 
+ 	return ret;
+ }
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * Note FE (0421): where backboardd's time in the kernel goes. Every IOKit external method backboardd calls is timed
++ * by (user client class, selector); every 30 s the ten with the most time are logged (NOTEFE UC). Boot-arg
++ * notefe_uc=0: off. A table of 64; calls that do not fit are counted together as "other".
++ */
++struct notefe_uc_slot {
++	const char *cls;
++	uint32_t sel, calls;
++	uint64_t abs, max;
++};
++static struct notefe_uc_slot notefe_uc[65];
++static uint64_t notefe_uc_last;
++static int notefe_uc_on = -1;
++static IOSimpleLock *notefe_uc_lock;
++
++static void
++notefe_uc_account(IOUserClient *client, uint32_t selector, uint64_t abs)
++{
++	if (notefe_uc_on < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("notefe_uc", &on, sizeof(on));
++		notefe_uc_lock = IOSimpleLockAlloc();
++		notefe_uc_on = (on && notefe_uc_lock) ? 1 : 0;
++	}
++	if (notefe_uc_on != 1) {
++		return;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "backboardd") != 0) {
++		return;
++	}
++	const char *cls = client->getMetaClass()->getClassName();
++	uint64_t now = mach_absolute_time(), period;
++	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &period);
++	struct notefe_uc_slot top[10];
++	unsigned ntop = 0, i;
++	IOSimpleLockLock(notefe_uc_lock);
++	for (i = 0; i < 64; i++) {
++		if (notefe_uc[i].cls == NULL || (notefe_uc[i].cls == cls && notefe_uc[i].sel == selector)) {
++			break;
++		}
++	}
++	struct notefe_uc_slot *slot = &notefe_uc[i];
++	slot->cls = i < 64 ? cls : "other";
++	slot->sel = i < 64 ? selector : 0;
++	slot->calls++;
++	slot->abs += abs;
++	if (abs > slot->max) {
++		slot->max = abs;
++	}
++	if (notefe_uc_last == 0) {
++		notefe_uc_last = now;
++	} else if (now - notefe_uc_last >= period) {
++		notefe_uc_last = now;
++		for (unsigned k = 0; k < 10; k++) {
++			int best = -1;
++			for (unsigned j = 0; j < 65; j++) {
++				if (notefe_uc[j].calls && (best < 0 || notefe_uc[j].abs > notefe_uc[best].abs)) {
++					best = (int)j;
++				}
++			}
++			if (best < 0) {
++				break;
++			}
++			top[ntop++] = notefe_uc[best];
++			notefe_uc[best].calls = 0;
++		}
++		for (unsigned j = 0; j < 65; j++) {
++			notefe_uc[j].calls = 0;
++			notefe_uc[j].abs = 0;
++			notefe_uc[j].max = 0;
++		}
++	}
++	IOSimpleLockUnlock(notefe_uc_lock);
++	for (unsigned k = 0; k < ntop; k++) {
++		uint64_t ns, mx;
++		absolutetime_to_nanoseconds(top[k].abs, &ns);
++		absolutetime_to_nanoseconds(top[k].max, &mx);
++		IOLog("NOTEFE UC: backboardd %s sel %u: %u calls, %llu ms in 30 s, max %llu us\n", top[k].cls, top[k].sel,
++		    top[k].calls, ns / 1000000, mx / 1000);
++	}
++}
++#endif
++
+ 
+ /* Routine io_user_client_method */
+ kern_return_t
+@@ -5089,7 +5175,15 @@ is_io_connect_method
+ 		ret = gIOUCFilterCallbacks->io_filter_applier(client, filterPolicy, io_filter_type_external_method, selector);
+ 	}
+ 	if (kIOReturnSuccess == ret) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		{
++			uint64_t notefe_t0 = mach_absolute_time();
++			ret = client->callExternalMethod( selector, &args );
++			notefe_uc_account(client, selector, mach_absolute_time() - notefe_t0);
++		}
++#else
+ 		ret = client->callExternalMethod( selector, &args );
++#endif
+ 	}
+ 
+ 	*scalar_outputCnt = args.scalarOutputCount;
+@@ -5203,7 +5297,15 @@ is_io_connect_async_method
+ 		ret = gIOUCFilterCallbacks->io_filter_applier(client, filterPolicy, io_filter_type_external_async_method, selector);
+ 	}
+ 	if (kIOReturnSuccess == ret) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		{
++			uint64_t notefe_t0 = mach_absolute_time();
++			ret = client->callExternalMethod( selector, &args );
++			notefe_uc_account(client, selector, mach_absolute_time() - notefe_t0);
++		}
++#else
+ 		ret = client->callExternalMethod( selector, &args );
++#endif
+ 	}
+ 
+ 	*scalar_outputCnt = args.scalarOutputCount;

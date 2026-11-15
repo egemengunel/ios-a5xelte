@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index a059a1c..4a17611 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1959,13 +1959,7 @@ notefe_brightness_set(uint32_t level, const char *why)
+ 		printf("NOTEFE BRIGHT: %u -> %u (%s)\n", notefe_bright_level, level, why);
+ 	}
+ 	notefe_bright_level = level;
+-	if (zc_on_window) {
+-		lck_mtx_lock(hg_mtx);
+-		if (zc_on_window) {
+-			zc_window_locked();     /* (0425) the window's plane alpha, at once: a still screen gets no frame */
+-		}
+-		lck_mtx_unlock(hg_mtx);
+-	}
++	/* (0428) no window alpha: a dimmed frame goes through the copy (the next present switches back to G1) */
+ }
+ 
+ uint32_t notefe_brightness_get(void);
+@@ -3544,17 +3538,15 @@ static uint32_t
+ zc_wincon(uint32_t level)
+ {
+ 	uint32_t v = (zc_win0 & ~((7u << 12) | 0xff00ff00u | (7u << 4) | (1u << 6))) | (5u << 12);
+-	if (level >= 255) {
+-		return v | (0xffu << 24) | (1u << 8);                   /* ALPHA1 0xff, PD_FUNC_COPY: as S-Boot's */
+-	}
+-	return v | (level << 16) | (0xdu << 8);                         /* ALPHA0 = level, ALPHA1 0, PD_FUNC_LEGACY */
++	(void)level;
++	return v | (0xffu << 24) | (1u << 8);                           /* ALPHA1 0xff, PD_FUNC_COPY: as S-Boot's (0428) */
+ }
+ 
+ static void
+ zc_window_locked(void)
+ {
+ 	uint32_t level = notefe_bright_level;
+-	if (zc_on_window && level == zc_alpha_level) {
++	if (zc_on_window) {
+ 		return;
+ 	}
+ 	hg_wr(zc_decon, 0x130, zc_wincon(level));
+@@ -3665,6 +3657,14 @@ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ 	if (zc_state < 0 || pa == 0 || pa + (uint64_t)bpr * h > 0x100000000ull) {
+ 		return false;
+ 	}
++	/*
++	 * (0428) Window plane alpha (Samsung's wincon(): ALPHA0, PD_FUNC_LEGACY) stalled the DECON (boot 25: the update
++	 * never taken, VGR0 deadlock). Until brightness has another way to the panel, zero copy only at full brightness;
++	 * dimmed, the GPU copy (whose blend dims) shows the frame.
++	 */
++	if (notefe_bright_level < 255) {
++		return false;
++	}
+ 	static uint32_t entered;
+ 	bool trace = ++entered <= 20;
+ 	if (trace) {

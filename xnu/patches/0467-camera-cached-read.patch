@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index e45fcdd..714437d 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2389,6 +2389,9 @@ static const struct { uint16_t reg, val; uint8_t bits; } nc_4e6_mode[] = {
+  * that were boot-args (the line is nearly full): sysctl kern.notefe_cam_{tp,skip,pll,settle,mode} (root), set by the bot
+  * from the drop zone's cam.opts; a boot-arg of the same name (notefe_cam_tp ...) still wins. */
+ extern vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);
++extern vm_offset_t notefe_physmap_cached(uint64_t pa, uint64_t len);       /* 0467 */
++extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
++static vm_offset_t nc_frame_c;          /* 0467: the ring, cacheable, for /dev/hakios-camera's reads */
+ static uint32_t nc_w = NC_FULL_W, nc_h = NC_FULL_H;
+ static uint32_t nc_o_tp, nc_o_skip, nc_o_pll = 166, nc_o_settle = 22, nc_o_mode;
+ SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_tp, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_tp, 0, "Note FE camera: test pattern (0 off)");
+@@ -3015,12 +3018,26 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			return ENOMEM;
+ 		}
+ 	}
+-	bcopy((const void *)(nc_frame + slot * NC_SLOT), nc_copy, NC_SW * NC_SH * 2);
++	/*
++	 * 0467: from a cacheable mapping of the ring, after cleaning and invalidating the slot's lines (the DMA wrote it),
++	 * and packed from there: the copy out of the write-combined mapping (2.5 MB, uncached reads) and the copy itself
++	 * took most of a read's ~45 ms (cam-bin2, 13.9 fps).
++	 */
++	vm_offset_t src0;
++	if (!nc_frame_c) {
++		nc_frame_c = notefe_physmap_cached(NC_BUF, NC_MAP_LEN);
++	}
++	if (nc_frame_c) {
++		src0 = nc_frame_c + slot * NC_SLOT;
++		flush_dcache(src0, NC_SW * NC_SH * 2, 0);
++	} else {
++		bcopy((const void *)(nc_frame + slot * NC_SLOT), nc_copy, NC_SW * NC_SH * 2);
++		src0 = (vm_offset_t)nc_copy;
++	}
+ 	uint32_t after = notefe_rd(csis, 0x100);
+ 	if (after - f >= 3) {
+ 		nc_torn++;
+ 	}
+-	vm_offset_t src0 = (vm_offset_t)nc_copy;
+ 	struct nc_cam_frame h = { .magic = "RWFRAME", .header_bytes = sizeof(h), .width = NC_SW, .height = NC_SH,
+ 		                  .stride = NC_STRIDE, .format = 1, .bayer = 1, .black = 64, .sequence = nc_seq,
+ 		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = 16340, .gain = nc_gain,
+@@ -3031,7 +3048,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	int error = uiomove((caddr_t)&h, (int)MIN(sizeof(h), (size_t)uio_resid(uio)), uio);
+ 	static uint8_t line[NC_STRIDE];
+ 	for (uint32_t y = 0; !error && y < NC_SH && uio_resid(uio) > 0; y++) {
+-		volatile uint16_t *src = (volatile uint16_t *)(src0 + y * NC_SW * 2);
++		const uint16_t *src = (const uint16_t *)(src0 + y * NC_SW * 2);
+ 		for (uint32_t x = 0, o = 0; x < NC_SW; x += 4, o += 5) {
+ 			uint16_t a = src[x] & 0x3ff, b = src[x + 1] & 0x3ff, c = src[x + 2] & 0x3ff, d = src[x + 3] & 0x3ff;
+ 			line[o] = (uint8_t)(a >> 2);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 627eb0c..2640ac4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1580,6 +1580,24 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+  * (0450). The descriptor and the map are never released. 0 if it cannot be mapped.
+  */
+ #include <IOKit/IOMemoryDescriptor.h>
++/* Note FE 0467: the same, cacheable (the camera stream's ring: read by the CPU after a cache flush, not written) */
++extern "C" vm_offset_t notefe_physmap_cached(uint64_t pa, uint64_t len);
++extern "C" vm_offset_t
++notefe_physmap_cached(uint64_t pa, uint64_t len)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa, (IOByteCount)len,
++	    kIODirectionInOut);
++	if (!md) {
++		return 0;
++	}
++	IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapDefaultCache);
++	if (!map) {
++		md->release();
++		return 0;
++	}
++	return (vm_offset_t)map->getVirtualAddress();
++}
++
+ extern "C" vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);
+ extern "C" vm_offset_t
+ notefe_physmap(uint64_t pa, uint64_t len)

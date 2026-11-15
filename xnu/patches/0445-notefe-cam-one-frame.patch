@@ -1,0 +1,279 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 61db52b..730dceb 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1831,6 +1831,7 @@ nc_read(uint8_t slave, uint8_t reg, uint8_t *v, unsigned n)
+ 
+ static void notefe_cam_front_id(vm_offset_t pins);
+ static void notefe_cam_csis_look(void);
++static void notefe_cam_frame(vm_offset_t pins);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1899,6 +1900,9 @@ notefe_cam_probe(int level)
+ 	if (level == 4) {
+ 		notefe_cam_csis_look();
+ 	}
++	if (level == 5) {
++		notefe_cam_frame(pins);
++	}
+ }
+ 
+ /*
+@@ -2239,6 +2243,238 @@ notefe_cam_csis_look(void)
+ 	printf("NOTEFE CAM: csis: CSIS2:%s\n", line);
+ }
+ 
++/*
++ * Note FE (0445): camera stage 5, one frame of the front camera into memory (kern.notefe_cam=5), each layer reported
++ * on its own (the advisor's plan): the sensor (its mode read back, its frame counter 0x0005 after stream-on), the link
++ * (CSIS2's D-PHY status, interrupt sources, frame counter), the DMA (DMA0's byte count; three 256 KB windows of the
++ * buffer pre-filled with 0xA5 and how much of each changed), the SysMMU (its status after). Order as Samsung's
++ * csi_stream_on + csi_hw_enable (fimc-is-device-csi_v2.c, fimc-is-hw-csi-v4_0.c): SysMMU 0x141e0000 (CSIS2's, by the
++ * DTB's master list) from 0x3 (CTRL_BLOCK_DISABLE: the master stalls) to 0 (CTRL_DISABLE: bypass) for the run; the
++ * MIPI PHY's PMU isolation 0x714 bit 0 bypassed and its reset (0x145f1050 bit 1) released; CSIS SW reset, every VC's
++ * DMA off, settle 22 (Samsung's cfg for 2608x1960@30), 2 lanes, CH0 VC0 RAW10 (0x2b, double clock) 2608 x 1960, DMA0
++ * 2D, normal packing, all eight frame pointers at 0xd0800000 (the camera ION range, outside XNU at the stock RAM
++ * level; 0xd8000000 is the bootloader framebuffer), shadow update, D-PHY clock, CSI on; then the sensor streams for
++ * 1.5 s. Everything put back as found on the way out. Only 768 KB of the buffer is mapped (io_submap is 8 MB).
++ */
++/* S5K4E6 init + 2608x1960 RAW10 2-lane mode: register facts from the MediaTek (Meizu m685) s5k4e6mipiraw_Sensor.c */
++/* sensor_init() + preview_setting() (GPL; values only), cross-checked with Allwinner sunxi-vin s5k4e6yx.c */
++static const struct { uint16_t reg, val; uint8_t bits; } nc_4e6_mode[] = {
++	{ 0xfcfc, 0x4000, 16 }, { 0x6010, 0x0001, 16 }, { 0x535a, 0xf800, 16 }, { 0x5402, 0x1500, 16 },
++	{ 0x5400, 0x061d, 16 }, { 0x6102, 0xc000, 16 }, { 0x614c, 0x25aa, 16 }, { 0x614e, 0x25b8, 16 },
++	{ 0x618c, 0x08d4, 16 }, { 0x618e, 0x08d6, 16 }, { 0x6028, 0x2000, 16 }, { 0x602a, 0x11a8, 16 },
++	{ 0x6f12, 0x3af9, 16 }, { 0x6f12, 0x1410, 16 }, { 0x6f12, 0x39f9, 16 }, { 0x6f12, 0x1410, 16 },
++	{ 0x6028, 0x2000, 16 }, { 0x602a, 0x12bc, 16 }, { 0x6f12, 0x1020, 16 }, { 0x602a, 0x12c2, 16 },
++	{ 0x6f12, 0x1020, 16 }, { 0x6f12, 0x1020, 16 }, { 0x602a, 0x12ca, 16 }, { 0x6f12, 0x1020, 16 },
++	{ 0x6f12, 0x1010, 16 }, { 0x602a, 0x12fc, 16 }, { 0x6f12, 0x1020, 16 }, { 0x602a, 0x1302, 16 },
++	{ 0x6f12, 0x1020, 16 }, { 0x6f12, 0x1020, 16 }, { 0x602a, 0x130a, 16 }, { 0x6f12, 0x1020, 16 },
++	{ 0x6f12, 0x1010, 16 }, { 0x602a, 0x14b8, 16 }, { 0x6f12, 0x0101, 16 }, { 0x602a, 0x14c0, 16 },
++	{ 0x6f12, 0x0000, 16 }, { 0x6f12, 0xffda, 16 }, { 0x6f12, 0xffda, 16 }, { 0x6f12, 0x0000, 16 },
++	{ 0x6f12, 0x0000, 16 }, { 0x6f12, 0xffda, 16 }, { 0x6f12, 0xffda, 16 }, { 0x6f12, 0x0000, 16 },
++	{ 0x602a, 0x1488, 16 }, { 0x6f12, 0xff80, 16 }, { 0x6f12, 0xff80, 16 }, { 0x6f12, 0xff80, 16 },
++	{ 0x6f12, 0xff80, 16 }, { 0x602a, 0x1496, 16 }, { 0x6f12, 0xff80, 16 }, { 0x6f12, 0xff80, 16 },
++	{ 0x6f12, 0xff80, 16 }, { 0x6f12, 0xff80, 16 }, { 0x602a, 0x14a4, 16 }, { 0x6f12, 0xffc0, 16 },
++	{ 0x6f12, 0xffc0, 16 }, { 0x6f12, 0xffc0, 16 }, { 0x6f12, 0xffc0, 16 }, { 0x602a, 0x147a, 16 },
++	{ 0x6f12, 0x0000, 16 }, { 0x6f12, 0x0002, 16 }, { 0x6f12, 0xfffc, 16 }, { 0x602a, 0x0512, 16 },
++	{ 0x6f12, 0x0111, 16 }, { 0x602a, 0x14ac, 16 }, { 0x6f12, 0x0000, 16 }, { 0x602a, 0x0524, 16 },
++	{ 0x6f12, 0x0007, 16 }, { 0x3284, 0x3800, 16 }, { 0x327a, 0x0001, 16 }, { 0x3282, 0x000a, 16 },
++	{ 0x3296, 0x0418, 16 }, { 0x32e0, 0x0000, 16 }, { 0x3286, 0x9000, 16 }, { 0x3298, 0x4007, 16 },
++	{ 0x327c, 0x0400, 16 }, { 0x328a, 0x0800, 16 }, { 0x3284, 0x3700, 16 }, { 0x32a0, 0x0320, 16 },
++	{ 0x32a2, 0x1000, 16 }, { 0x32a4, 0x0c00, 16 }, { 0x3204, 0x000c, 16 }, { 0x3206, 0x000b, 16 },
++	{ 0x3208, 0x0009, 16 }, { 0x3210, 0x0007, 16 }, { 0x3212, 0x0007, 16 }, { 0x0200, 0x0408, 16 },
++	{ 0x3218, 0x031c, 16 }, { 0x321a, 0x3224, 16 }, { 0x321c, 0x0700, 16 }, { 0x321e, 0x0800, 16 },
++	{ 0x3220, 0x1300, 16 }, { 0x3226, 0x525c, 16 }, { 0x3228, 0x0304, 16 }, { 0x5330, 0xd403, 16 },
++	{ 0x5428, 0x1800, 16 }, { 0x0304, 0x0006, 16 }, { 0x0306, 0x00b4, 16 }, { 0x5362, 0x0a00, 16 },
++	{ 0x5364, 0x4298, 16 }, { 0x534e, 0x4910, 16 }, { 0x0340, 0x07f8, 16 }, { 0x0342, 0x0b68, 16 },
++	{ 0x0202, 0x03fc, 16 }, { 0x0344, 0x0000, 16 }, { 0x0346, 0x0000, 16 }, { 0x0348, 0x0a2f, 16 },
++	{ 0x034a, 0x07a7, 16 }, { 0x034c, 0x0a30, 16 }, { 0x034e, 0x07a8, 16 }, { 0x3500, 0x0022, 16 },
++	{ 0x3088, 0x0000, 16 }, { 0x0216, 0x0000, 16 }, { 0x5332, 0x04e0, 16 }, { 0x5080, 0x0100, 16 },
++	{ 0x32aa, 0x0000, 16 }, { 0x6028, 0x2000, 16 }, { 0x602a, 0x0668, 16 }, { 0x6f12, 0x4010, 16 },
++	{ 0x0101, 0x0003, 8 },
++};
++/* 121 writes */
++
++#define NC_BUF          0xd0800000u
++#define NC_W            2608u
++#define NC_H            1960u
++
++static bool
++nc_sensor_write(uint8_t a7, uint16_t reg, uint16_t val, int bits)
++{
++	nc_start();
++	bool ok = nc_byte_out((uint8_t)(a7 << 1)) && nc_byte_out((uint8_t)(reg >> 8)) && nc_byte_out((uint8_t)reg);
++	if (ok && bits == 16) {
++		ok = nc_byte_out((uint8_t)(val >> 8));
++	}
++	if (ok) {
++		ok = nc_byte_out((uint8_t)val);
++	}
++	nc_stop();
++	return ok;
++}
++
++static uint16_t
++nc_sensor_rd16(uint16_t reg)
++{
++	uint8_t b[2] = { 0xff, 0xff };
++	nc_sensor_read(0x35, reg, b, 2);
++	return (uint16_t)(b[0] << 8 | b[1]);
++}
++
++static void
++nc_csis_report(vm_offset_t csis, vm_offset_t mmu, const char *when)
++{
++	uint8_t fc = 0xee;
++	nc_sensor_read(0x35, 0x0005, &fc, 1);
++	printf("NOTEFE CAM: frame %s: sensor frame count %#x; CSIS2 DPHY_STATUS %#x INT_SRC0 %#x INT_SRC1 %#x FRM_CNT_CH0 %u "
++	    "DMA0 ctrl %#x act %#x bytes %u; SysMMU status %#x\n", when, fc, notefe_rd(csis, 0x20), notefe_rd(csis, 0x14),
++	    notefe_rd(csis, 0x1c), notefe_rd(csis, 0x100), notefe_rd(csis, 0x1000), notefe_rd(csis, 0x1030),
++	    notefe_rd(csis, 0x1040), notefe_rd(mmu, 8));
++}
++
++static void
++notefe_cam_frame(vm_offset_t pins)
++{
++	static vm_offset_t top, csis, phy, pmu, mmu, win[3];
++	static const uint32_t win_off[3] = { 0, 0x600000, 0x980000 };
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++		csis = ml_io_map(0x14100000u, 0x2000);
++		phy = ml_io_map(0x145f1000u, 0x1000);
++		pmu = ml_io_map(0x105c0000u, 0x1000);
++		mmu = ml_io_map(0x141e0000u, 0x1000);
++		for (unsigned i = 0; i < 3; i++) {
++			win[i] = ml_io_map(NC_BUF + win_off[i], 0x40000);
++		}
++	}
++	if (!top || !csis || !phy || !pmu || !mmu || !win[0] || !win[1] || !win[2]) {
++		printf("NOTEFE CAM: frame: map failed\n");
++		return;
++	}
++	nc_pins = pins;
++	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
++	for (unsigned i = 0; i < 3; i++) {
++		for (uint32_t o = 0; o < 0x40000; o += 4) {
++			*(volatile uint32_t *)(win[i] + o) = 0xa5a5a5a5u;
++		}
++	}
++	/* power, as stage 3 */
++	uint8_t l5 = 0, l6 = 0, l7 = 0, l13 = 0;
++	if (!nc_read(0x59, 0x22, &l5, 1) || !nc_read(0x59, 0x23, &l6, 1) || !nc_read(0x59, 0x24, &l7, 1) ||
++	    !nc_read(0x59, 0x2a, &l13, 1)) {
++		printf("NOTEFE CAM: frame: the S2MPB02 does not answer\n");
++		return;
++	}
++	nc_pin(pins, 0x120, 1, 1, -1, 0);
++	nc_pin(pins, 0x100, 4, 1, -1, 0);
++	nc_line(NC_SDA, 1);
++	nc_line(NC_SCL, 1);
++	nc_pmic_write(0x2a, 0x80 | 0x5c);
++	nc_pmic_write(0x23, 0x80 | 0x30);
++	nc_pmic_write(0x22, 0x80 | 0x30);
++	nc_pmic_write(0x24, 0x80 | 0x30);
++	delay(1000);
++	nc_pin(pins, 0x100, 4, 1, -1, 1);
++	delay(40);
++	uint32_t div = notefe_rd(top, 0xb24), mux = notefe_rd(top, 0xb20);
++	notefe_wr(top, 0xb20, mux & ~(7u << 12));
++	delay(100);
++	notefe_wr(top, 0xb24, div & ~0xffu);
++	nc_pin(pins, 0x180, 2, 2, -1, -1);
++	delay(10000);
++	uint16_t id = nc_sensor_rd16(0x0000);
++	uint32_t mmu_ctrl = notefe_rd(mmu, 0), iso = notefe_rd(pmu, 0x714), phyc = notefe_rd(phy, 0x50);
++	unsigned bad = 0;
++	if (id != 0x4e60) {
++		printf("NOTEFE CAM: frame: model ID %#x, not the 4E6: stopped\n", id);
++		goto power_down;
++	}
++	/* the sensor's mode */
++	nc_sensor_write(0x35, 0x0100, 0, 8);
++	for (unsigned i = 0; i < sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0]); i++) {
++		bad += !nc_sensor_write(0x35, nc_4e6_mode[i].reg, nc_4e6_mode[i].val, nc_4e6_mode[i].bits);
++	}
++	printf("NOTEFE CAM: frame: sensor mode written (%u writes, %u not acknowledged); read back: output %u x %u, line %u, "
++	    "frame %u lines, PLL %u/%u\n", (unsigned)(sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0])), bad, nc_sensor_rd16(0x034c),
++	    nc_sensor_rd16(0x034e), nc_sensor_rd16(0x0342), nc_sensor_rd16(0x0340), nc_sensor_rd16(0x0306), nc_sensor_rd16(0x0304));
++	/* the receiver */
++	notefe_wr(mmu, 0, 0);
++	notefe_wr(pmu, 0x714, iso | 1);
++	notefe_wr(phy, 0x50, phyc & ~2u);
++	notefe_wr(phy, 0x50, phyc | 2u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	for (unsigned n = 0; n < 100 && (notefe_rd(csis, 0x4) & 2u); n++) {
++		delay(10);
++	}
++	for (unsigned vc = 0; vc < 4; vc++) {
++		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
++	}
++	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | (22u << 24) | (3u << 1));
++	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (1u << 8));
++	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
++	notefe_wr(csis, 0x44, (NC_H << 16) | NC_W);
++	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
++	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++		notefe_wr(csis, a, NC_BUF);
++	}
++	notefe_wr(csis, 0x1000, (notefe_rd(csis, 0x1000) & ~1u) | 2u);
++	notefe_wr(csis, 0x14, notefe_rd(csis, 0x14));
++	notefe_wr(csis, 0x1c, notefe_rd(csis, 0x1c));
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | (0xfu << 16));
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
++	printf("NOTEFE CAM: frame: CSIS2 set: CMN %#x DPHY_CMN %#x CH0 %#x/%#x DMA0 ctrl %#x fmt %#x addr %#x; PHY %#x iso %#x; "
++	    "SysMMU ctrl %#x (was %#x)\n", notefe_rd(csis, 0x4), notefe_rd(csis, 0x24), notefe_rd(csis, 0x40), notefe_rd(csis, 0x44),
++	    notefe_rd(csis, 0x1000), notefe_rd(csis, 0x1004), notefe_rd(csis, 0x1010), notefe_rd(phy, 0x50),
++	    notefe_rd(pmu, 0x714), notefe_rd(mmu, 0), mmu_ctrl);
++	/* stream */
++	nc_sensor_write(0x35, 0x0100, 1, 8);
++	delay(100000);
++	nc_csis_report(csis, mmu, "after 100 ms");
++	delay(400000);
++	nc_csis_report(csis, mmu, "after 500 ms");
++	delay(1000000);
++	nc_csis_report(csis, mmu, "after 1.5 s");
++	nc_sensor_write(0x35, 0x0100, 0, 8);
++	delay(50000);
++	/* receiver down, as found */
++	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	delay(100);
++	notefe_wr(phy, 0x50, phyc & ~2u);
++	notefe_wr(phy, 0x50, phyc);
++	notefe_wr(pmu, 0x714, iso);
++	notefe_wr(mmu, 0, mmu_ctrl);
++	for (unsigned i = 0; i < 3; i++) {
++		uint32_t changed = 0, last = 0;
++		for (uint32_t o = 0; o < 0x40000; o += 4) {
++			if (*(volatile uint32_t *)(win[i] + o) != 0xa5a5a5a5u) {
++				changed++;
++				last = o;
++			}
++		}
++		volatile uint32_t *w = (volatile uint32_t *)win[i];
++		printf("NOTEFE CAM: frame: buffer +%#x: %u of 65536 words changed%s, the last at +%#x; first %08x %08x %08x %08x\n",
++		    win_off[i], changed, changed ? " (THE DMA WROTE)" : "", win_off[i] + last, w[0], w[1], w[2], w[3]);
++	}
++power_down:
++	nc_pin(pins, 0x180, 2, 0, -1, -1);
++	notefe_wr(top, 0xb24, div);
++	notefe_wr(top, 0xb20, mux);
++	nc_pin(pins, 0x100, 4, 1, -1, 0);
++	nc_pin(pins, 0x120, 1, 1, -1, 0);
++	nc_pmic_write(0x24, l7 & 0x7f);
++	nc_pmic_write(0x22, l5 & 0x7f);
++	delay(2000);
++	nc_pmic_write(0x2a, l13 & 0x7f);
++	delay(2000);
++	nc_pmic_write(0x23, l6 & 0x7f);
++	nc_pin(pins, 0x140, NC_SDA, 0, -1, -1);
++	nc_pin(pins, 0x140, NC_SCL, 0, -1, -1);
++	printf("NOTEFE CAM: frame: powered down, receiver and SysMMU as found (ctrl %#x)\n", notefe_rd(mmu, 0));
++}
++
+ static int
+ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -2251,7 +2487,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 4) {
++	if (value < 1 || value > 5) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
+@@ -2260,7 +2496,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID, 4 CSIS2 look)");
++    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID, 4 CSIS2 look, 5 one frame)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 714437d..b13ea9c 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2594,10 +2594,6 @@ notefe_cam_frame(vm_offset_t pins)
+ 	if (mode == 1) {        /* SMIA 2x2 binning (0x0900 enable, 0x0901 type 0x22), output 1304 x 980 */
+ 		bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
+ 		bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
+-		/* 0466: the odd increments that make 0x0901 bin (MediaTek slim_video: x_odd_inc 1, y_odd_inc 3); without them
+-		 * the sensor gave the top-left 1304 x 980 of the full picture (owner: "the top left 25%") */
+-		bad += !nc_sensor_write(0x35, 0x0383, 0x01, 8);
+-		bad += !nc_sensor_write(0x35, 0x0387, 0x03, 8);
+ 		bad += !nc_sensor_write(0x35, 0x034c, 1304, 16);
+ 		bad += !nc_sensor_write(0x35, 0x034e, 980, 16);
+ 	} else if (mode == 2) { /* SMIA crop: x 664-1943, y 620-1339, output 1280 x 720 */
+@@ -2893,8 +2889,6 @@ nc_stream_up(void)
+ 	}
+ 	bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
+ 	bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
+-	bad += !nc_sensor_write(0x35, 0x0383, 0x01, 8);         /* 0466: see the mode 1 setup */
+-	bad += !nc_sensor_write(0x35, 0x0387, 0x03, 8);
+ 	bad += !nc_sensor_write(0x35, 0x034c, NC_SW, 16);
+ 	bad += !nc_sensor_write(0x35, 0x034e, NC_SH, 16);
+ 	if (nc_o_tp) {

@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 4c01462..b2bb471 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2368,7 +2368,7 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+ static void
+ notefe_cam_frame(vm_offset_t pins)
+ {
+-	static vm_offset_t top, csis, phy, pmu, mmu, win[3];
++	static vm_offset_t top, csis, phy, pmu, mmu, win[3], cam1;
+ 	static const uint32_t win_off[3] = { 0, 0x600000, 0x980000 };
+ 	if (!top) {
+ 		top = ml_io_map(0x10570000u, 0x1000);
+@@ -2376,11 +2376,12 @@ notefe_cam_frame(vm_offset_t pins)
+ 		phy = ml_io_map(0x145f1000u, 0x1000);
+ 		pmu = ml_io_map(0x105c0000u, 0x1000);
+ 		mmu = ml_io_map(0x141e0000u, 0x1000);
++		cam1 = ml_io_map(0x145d0000u, 0x1000);
+ 		for (unsigned i = 0; i < 3; i++) {
+ 			win[i] = ml_io_map(NC_BUF + win_off[i], 0x40000);
+ 		}
+ 	}
+-	if (!top || !csis || !phy || !pmu || !mmu || !win[0] || !win[1] || !win[2]) {
++	if (!top || !csis || !phy || !pmu || !mmu || !cam1 || !win[0] || !win[1] || !win[2]) {
+ 		printf("NOTEFE CAM: frame: map failed\n");
+ 		return;
+ 	}
+@@ -2441,6 +2442,19 @@ notefe_cam_frame(vm_offset_t pins)
+ 	notefe_wr(pmu, 0x714, iso | 1);
+ 	notefe_wr(phy, 0x50, phyc & ~2u);
+ 	notefe_wr(phy, 0x50, phyc | 2u);
++	/* 0449 (the advisor, from cam-4's rxbyte0 0x200000): CSIS2's four lane byte clocks were muxed to OSCCLK (select 0);
++	 * select 1 is the PHY's RXBYTECLKHSn (Linux's cam1_phyN_csis2), gates 0x850-0x85c bit 0 */
++	uint32_t rx_mux[4], rx_gate[4];
++	for (unsigned n = 0; n < 4; n++) {
++		rx_mux[n] = notefe_rd(cam1, 0x22c + 4 * n);
++		rx_gate[n] = notefe_rd(cam1, 0x850 + 4 * n);
++		notefe_wr(cam1, 0x22c + 4 * n, rx_mux[n] | (1u << 12));
++		notefe_wr(cam1, 0x850 + 4 * n, rx_gate[n] | 1u);
++	}
++	printf("NOTEFE CAM: frame: lane byte clocks: mux %#x %#x %#x %#x -> %#x %#x %#x %#x (status %#x), gates %#x %#x %#x %#x\n",
++	    rx_mux[0], rx_mux[1], rx_mux[2], rx_mux[3], notefe_rd(cam1, 0x22c), notefe_rd(cam1, 0x230), notefe_rd(cam1, 0x234),
++	    notefe_rd(cam1, 0x238), notefe_rd(cam1, 0x62c), notefe_rd(cam1, 0x850), notefe_rd(cam1, 0x854), notefe_rd(cam1, 0x858),
++	    notefe_rd(cam1, 0x85c));
+ 	nc_csis_setup(csis, settle);
+ 	printf("NOTEFE CAM: frame: CSIS2 set: CMN %#x DPHY_CMN %#x CH0 %#x/%#x DMA0 ctrl %#x fmt %#x addr %#x; PHY %#x iso %#x; "
+ 	    "SysMMU ctrl %#x (was %#x)\n", notefe_rd(csis, 0x4), notefe_rd(csis, 0x24), notefe_rd(csis, 0x40), notefe_rd(csis, 0x44),
+@@ -2495,6 +2509,10 @@ notefe_cam_frame(vm_offset_t pins)
+ 	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
+ 	delay(100);
++	for (unsigned n = 0; n < 4; n++) {
++		notefe_wr(cam1, 0x22c + 4 * n, rx_mux[n]);
++		notefe_wr(cam1, 0x850 + 4 * n, rx_gate[n]);
++	}
+ 	notefe_wr(phy, 0x50, phyc & ~2u);
+ 	notefe_wr(phy, 0x50, phyc);
+ 	notefe_wr(pmu, 0x714, iso);

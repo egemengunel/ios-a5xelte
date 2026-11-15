@@ -1,0 +1,201 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 99200b1..d1ec83a 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -715,6 +715,116 @@ hg_recover(const char *what)
+ 	}
+ }
+ 
++/*
++ * Note FE (0415): wait for a client's job on the Mali's interrupt instead of polling. The polling loop read three
++ * registers every 10 us for the whole job (delay() sleeps and wakes on a timer each time here): backboardd's
++ * submitting thread was on a CPU for as long as the GPU worked, 31 % of all its samples (HERO_PROF, boot 11). Now:
++ * a short spin (most vertex/tiler jobs end within it), then the job's done/fail bits, any MMU fault and the GPU fault
++ * bits are unmasked, the GIC line (INTID 256-258, TWRP's /proc/interrupts) wakes the thread, and the handler masks
++ * them again (level-triggered: the line drops). A 2 ms timeout re-reads the status, so a missing interrupt costs
++ * time, not a hang; 200 ms in all, as before. Boot-arg herogpuirq=0: polling as before.
++ */
++#define JOB_IRQ_MASK    0x1008
++#define MMU_IRQ_MASK    0x2008
++#define GPU_IRQ_MASK    0x028
++static int hg_irq_state;                /* 0 not tried, 1 routed, -1 off */
++static volatile uint32_t hg_irq_armed;
++static uint32_t hg_irq_count, hg_irq_slept, hg_irq_timeouts, hg_irq_waits;
++static uint64_t hg_irq_sleep_us;
++static char hg_irq_event;
++
++extern bool herolte_gic_route_spi(uint32_t intid, unsigned int logical);
++
++void herolte_gpu_irq(uint32_t intid);
++void
++herolte_gpu_irq(uint32_t intid)
++{
++	(void)intid;
++	hg_irq_count++;
++	if (hg_irq_armed && hg_gpu) {
++		hg_irq_armed = 0;
++		hg_wr(hg_gpu, JOB_IRQ_MASK, 0);
++		hg_wr(hg_gpu, MMU_IRQ_MASK, 0);
++		hg_wr(hg_gpu, GPU_IRQ_MASK, 0);
++	}
++	thread_wakeup((event_t)&hg_irq_event);
++}
++
++static bool
++hg_irq_ready(void)
++{
++	if (hg_irq_state == 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("herogpuirq", &on, sizeof(on));
++		hg_irq_state = -1;
++		if (on && hg_gpu) {
++			hg_wr(hg_gpu, JOB_IRQ_MASK, 0);
++			hg_wr(hg_gpu, MMU_IRQ_MASK, 0);
++			hg_wr(hg_gpu, GPU_IRQ_MASK, 0);
++			bool ok = herolte_gic_route_spi(256, 0) && herolte_gic_route_spi(257, 0) &&
++			    herolte_gic_route_spi(258, 0);
++			hg_irq_state = ok ? 1 : -1;
++		}
++		printf("NOTEFE GPUIRQ: %s\n", hg_irq_state == 1 ? "job waits on INTID 256-258 (CPU 0)" :
++		    on ? "routing failed, polling" : "off (herogpuirq=0), polling");
++	}
++	return hg_irq_state == 1;
++}
++
++static bool
++hg_job_ended(unsigned js, uint32_t *jirq, uint32_t *mirq, uint32_t *girq)
++{
++	*jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++	*mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++	*girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++	return (*jirq & ((1u << js) | (1u << (js + 16)))) || *mirq || (*girq & 0x81);
++}
++
++static void
++hg_wait_irq(unsigned js, uint32_t *jirq, uint32_t *mirq, uint32_t *girq)
++{
++	uint64_t start = mach_absolute_time(), spin, limit, now;
++	nanoseconds_to_absolutetime(30 * NSEC_PER_USEC, &spin);
++	nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++	hg_irq_waits++;
++	while (!hg_job_ended(js, jirq, mirq, girq)) {
++		now = mach_absolute_time();
++		if (now - start >= limit) {
++			hg_irq_timeouts++;
++			break;
++		}
++		if (now - start < spin) {
++			continue;
++		}
++		assert_wait_timeout((event_t)&hg_irq_event, THREAD_UNINT, 2000, NSEC_PER_USEC);
++		hg_irq_armed = 1;
++		hg_wr(hg_gpu, JOB_IRQ_MASK, (1u << js) | (1u << (js + 16)));
++		hg_wr(hg_gpu, MMU_IRQ_MASK, 0xffffffffu);
++		hg_wr(hg_gpu, GPU_IRQ_MASK, 0x81);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (hg_job_ended(js, jirq, mirq, girq)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			uint64_t t0 = mach_absolute_time();
++			hg_irq_slept++;
++			(void)thread_block(THREAD_CONTINUE_NULL);
++			hg_irq_sleep_us += hg_us_since(t0);
++		}
++		hg_irq_armed = 0;
++		hg_wr(hg_gpu, JOB_IRQ_MASK, 0);
++		hg_wr(hg_gpu, MMU_IRQ_MASK, 0);
++		hg_wr(hg_gpu, GPU_IRQ_MASK, 0);
++	}
++	if (hg_irq_slept >= 200 && hg_irq_count == 0) {
++		hg_irq_state = -1;      /* the line never fired: back to polling rather than 2 ms a job */
++		printf("NOTEFE GPUIRQ: no interrupt after %u sleeps: polling from now on\n", hg_irq_slept);
++	}
++	if ((hg_irq_waits & 0x1fff) == 0) {
++		printf("NOTEFE GPUIRQ: %u jobs waited for, %u slept (%llu us asleep), %u interrupts, %u timeouts\n",
++		    hg_irq_waits, hg_irq_slept, hg_irq_sleep_us, hg_irq_count, hg_irq_timeouts);
++	}
++}
++
+ /* Program AS0, start the job at HG_TEST_VA on slot js, wait (bounded). */
+ static bool
+ hg_run(unsigned js, const char *what)
+@@ -762,14 +872,18 @@ hg_run(unsigned js, const char *what)
+ 	hg_wr(hg_gpu, slot + 0x60, 1);                          /* START */
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
+-	for (unsigned i = 0; i < 20000; i++) {
+-		jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
+-		mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
+-		girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
+-		if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
+-			break;
++	if (hg_run_quiet && hg_irq_ready()) {
++		hg_wait_irq(js, &jirq, &mirq, &girq);
++	} else {
++		for (unsigned i = 0; i < 20000; i++) {
++			jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++			if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++				break;
++			}
++			delay(10);
+ 		}
+-		delay(10);
+ 	}
+ 	volatile uint32_t *hdr = (volatile uint32_t *)(hg_job_cpu ? hg_job_cpu : hg_mem + HG_DATA_OFF);
+ 	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 87fb8a8..235fe8d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1896,6 +1896,14 @@ sleh_irq(arm_saved_state_t *state)
+ 		A5_IRQ_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
++#if defined(HEROLTE)
++	} else if (intid >= 256 && intid <= 258) {
++		/* Note FE (0415): the Mali's job/MMU/GPU lines wake the thread waiting for its job (herolte_gpu.c). */
++		extern void herolte_gpu_irq(uint32_t intid);
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		herolte_gpu_irq(intid);
++		A5_IRQ_EOI(iar);
++#endif
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index c37636f..4105d5b 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -273,6 +273,30 @@ a5xelte_send_ipi(unsigned int logical)
+ 	a5_gic_write32(a5_gicd_base, 0xf00,
+ 	    ((uint32_t)a5_gic_cpu_masks[logical] << 16) | 1U);
+ }
++
++/*
++ * Note FE (0415): route one shared peripheral interrupt (level, Group 1, priority 0xa0) to a logical CPU and enable
++ * it. Used for the Mali's job/MMU/GPU lines (INTID 256-258, TWRP's /proc/interrupts). False if not possible.
++ */
++bool
++herolte_gic_route_spi(uint32_t intid, unsigned int logical)
++{
++	if (!a5_gicd_base || intid < 32 || intid >= 1020 || logical >= SWEET_SMP_MAX_CPUS ||
++	    a5_gic_cpu_masks[logical] == 0) {
++		return false;
++	}
++	unsigned int word = (intid / 32) * 4, bit = intid % 32;
++	a5_gic_write32(a5_gicd_base, 0x180 + word, 1U << bit);                  /* ICENABLER: off while set up */
++	a5_gic_write32(a5_gicd_base, 0x080 + word, a5_gic_read32(a5_gicd_base, 0x080 + word) | (1U << bit));
++	*(volatile uint8_t *)(a5_gicd_base + 0x400 + intid) = 0xa0;            /* IPRIORITYR */
++	*(volatile uint8_t *)(a5_gicd_base + 0x800 + intid) = a5_gic_cpu_masks[logical];  /* ITARGETSR */
++	unsigned int cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2;
++	a5_gic_write32(a5_gicd_base, cfg, a5_gic_read32(a5_gicd_base, cfg) & ~(3U << shift));  /* level */
++	a5_gic_write32(a5_gicd_base, 0x280 + word, 1U << bit);                  /* ICPENDR */
++	a5_gic_write32(a5_gicd_base, 0x100 + word, 1U << bit);                  /* ISENABLER */
++	__builtin_arm_dsb(DSB_SY);
++	return (a5_gic_read32(a5_gicd_base, 0x100 + word) & (1U << bit)) != 0;
++}
+ #endif
+ 
+ void

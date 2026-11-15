@@ -23,3 +23,7 @@ nvram.txt*
 *.blob
 *.adt
 payload*.bin
+# Galaxy Note FE (gracerlte/): local build outputs, the phone's logs and its own data (serial, calibration)
+build/
+logs/
+phone-info/

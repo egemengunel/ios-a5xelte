@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 9a572c9..8611d68 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1729,7 +1729,7 @@ SYSCTL_PROC(_kern, OID_AUTO, notefe_wdt_stop, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
+  *      CMU_TOP's four sensor clocks (0xb00 + 0x10 n: mux, divider, status, enable), CMU_PERIC0's gates (0x800: bit 13
+  *      HSI2C9, the bus of the S2MPB02), the pins: gpd1 (HSI2C9 on 4/5), gpc0 (front reset 4), gpc1 (front standby 1),
+  *      gpc2 (the ISP's I2C1 on 2/3), gpk0 (front MCLK 2). No camera-block register is read.
+- *   2  the S2MPB02 (0x59 on HSI2C9, 0x13680000) read: ID, CTRL, BUCK2, LDO1-18 (0x1f-0x30). HSI2C9's pins to function
++ *   2  the S2MPB02 (0x59 on HSI2C9, 0x13680000) read: ID, CTRL, BUCK2, LDO1-18 (0x1e-0x2f; 0437-0439 read 0x1f-0x30). HSI2C9's pins to function
+  *      2 if they are not; HSI2C9's own registers set up as the battery's bus is. The PMIC itself is not written.
+  */
+ static int notefe_cam_last;
+@@ -1885,7 +1885,7 @@ notefe_cam_probe(int level)
+ 	nc_read(0x59, 0x04, &ctrl, 1);
+ 	nc_read(0x59, 0x0d, b2, 2);
+ 	printf("NOTEFE CAM: S2MPB02 CTRL %#x BUCK2 ctrl1 %#x ctrl2 %#x\n", ctrl, b2[0], b2[1]);
+-	if (nc_read(0x59, 0x1f, ldo, sizeof(ldo))) {
++	if (nc_read(0x59, 0x1e, ldo, sizeof(ldo))) {      /* 0440: L1CTRL is 0x1e (LDOn at 0x1d + n) */
+ 		static const uint8_t step25[18] = { 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+ 		for (unsigned i = 0; i < 18; i++) {
+ 			unsigned mv = 600 + (ldo[i] & 0x7f) * (step25[i] ? 25u : 12u) + (step25[i] ? 0 : (ldo[i] & 0x7f) / 2);
+@@ -1900,8 +1900,8 @@ notefe_cam_probe(int level)
+ /*
+  * Note FE (0438): camera stage 3, the front S5K4E6 powered and asked its model ID, then powered down (kern.notefe_cam=3).
+  * Samsung's order (fimc-is-module-4e6.c, SENSOR_SCENARIO_NORMAL, GPIO_SCENARIO_ON): standby low (gpc1-1), reset low
+- * (gpc0-4), VDDA_2.9V_VT (S2MPB02 LDO13 0x2b = 0x80 | 0x5c), VDDIO_1.8V_VT (LDO6 0x24 = 0x80 | 0x30), VDDD_1.2V_VT
+- * (LDO5 0x23 = 0x80 | 0x30), 1 ms, reset high, 40 us, MCLK (gpk0-2) to function 2. The sensor's I2C (sensor_i2c_addr
++ * (gpc0-4), VDDA_2.9V_VT (S2MPB02 LDO13 0x2a = 0x80 | 0x5c), VDDIO_1.8V_VT (LDO6 0x23 = 0x80 | 0x30), VDDD_1.2V_VT
++ * (LDO5 0x22 = 0x80 | 0x30; 0438-0439 used 0x23/0x24/0x2b, one off: LDO6, LDO7 and LDO14 OIS_VM_2.8V at 2.9 V for < 1 s), 1 ms, reset high, 40 us, MCLK (gpk0-2) to function 2. The sensor's I2C (sensor_i2c_addr
+  * 0x6a, 8-bit: 0x35) is the ISP's own (pins gpc2-2 SDA, gpc2-3 SCL, function 2), which its firmware drives: here the two
+  * pins are bit-banged instead (released = input with pull-up, low = output 0), about 100 kHz. Read: 0x0000 (model ID,
+  * 16 bits, 16-bit register addresses), 0x0002 (revision), 0x0005 (frame count). Power-down: the reverse, each LDO's
+@@ -1996,7 +1996,7 @@ notefe_cam_front_id(vm_offset_t pins)
+ {
+ 	nc_pins = pins;
+ 	uint8_t l5 = 0, l6 = 0, l13 = 0;
+-	if (!nc_read(0x59, 0x23, &l5, 1) || !nc_read(0x59, 0x24, &l6, 1) || !nc_read(0x59, 0x2b, &l13, 1)) {
++	if (!nc_read(0x59, 0x22, &l5, 1) || !nc_read(0x59, 0x23, &l6, 1) || !nc_read(0x59, 0x2a, &l13, 1)) {
+ 		printf("NOTEFE CAM: front: the S2MPB02 does not answer, nothing powered\n");
+ 		return;
+ 	}
+@@ -2005,21 +2005,27 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 0);            /* reset low */
+ 	nc_line(NC_SDA, 1);
+ 	nc_line(NC_SCL, 1);
+-	bool p13 = nc_pmic_write(0x2b, 0x80 | 0x5c);
+-	bool p6 = nc_pmic_write(0x24, 0x80 | 0x30);
+-	bool p5 = nc_pmic_write(0x23, 0x80 | 0x30);
++	bool p13 = nc_pmic_write(0x2a, 0x80 | 0x5c);
++	bool p6 = nc_pmic_write(0x23, 0x80 | 0x30);
++	bool p5 = nc_pmic_write(0x22, 0x80 | 0x30);
+ 	delay(1000);
+ 	uint8_t r5 = 0, r6 = 0, r13 = 0;
+-	nc_read(0x59, 0x23, &r5, 1);
+-	nc_read(0x59, 0x24, &r6, 1);
+-	nc_read(0x59, 0x2b, &r13, 1);
++	nc_read(0x59, 0x22, &r5, 1);
++	nc_read(0x59, 0x23, &r6, 1);
++	nc_read(0x59, 0x2a, &r13, 1);
+ 	printf("NOTEFE CAM: front: VDDA 2.9 V (LDO13) %s %#x, VDDIO 1.8 V (LDO6) %s %#x, VDDD 1.2 V (LDO5) %s %#x\n",
+ 	    p13 ? "on" : "FAILED", r13, p6 ? "on" : "FAILED", r6, p5 ? "on" : "FAILED", r5);
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 1);            /* reset high */
+ 	delay(40);
++	static vm_offset_t top;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++	}
++	uint32_t div = notefe_rd(top, 0xb24);
++	notefe_wr(top, 0xb24, div & ~0xffu);            /* 0440: SCLK_ISP_SENSOR2 from OSCCLK undivided: 26 MHz (was /4) */
+ 	notefe_pin(pins, 0x180, 2, 2, -1, -1);          /* MCLK out */
+ 	delay(5000);
+-	printf("NOTEFE CAM: front: reset high, MCLK on (gpk0 con %#x); the lines idle SDA %u SCL %u\n", notefe_rd(pins, 0x180),
++	printf("NOTEFE CAM: front: reset high, MCLK on (gpk0 con %#x, divider %#x -> %#x); the lines idle SDA %u SCL %u\n", notefe_rd(pins, 0x180), div, notefe_rd(top, 0xb24),
+ 	    nc_sda(), (notefe_rd(pins, 0x144) >> NC_SCL) & 1);
+ 	/* 0439: each line driven low and read back (is the pin ours, is it pulled up), then every address in both orders */
+ 	for (unsigned pin = 2; pin <= 3; pin++) {
+@@ -2066,16 +2072,17 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	NC_SCL = 3;
+ 	/* down again, the reverse */
+ 	notefe_pin(pins, 0x180, 2, 0, -1, -1);
++	notefe_wr(top, 0xb24, div);
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 0);
+ 	notefe_pin(pins, 0x120, 1, 1, 0, 0);
+-	nc_pmic_write(0x23, l5 & 0x7f);
++	nc_pmic_write(0x22, l5 & 0x7f);
+ 	delay(2000);
+-	nc_pmic_write(0x2b, l13 & 0x7f);
++	nc_pmic_write(0x2a, l13 & 0x7f);
+ 	delay(2000);
+-	nc_pmic_write(0x24, l6 & 0x7f);
+-	nc_read(0x59, 0x23, &r5, 1);
+-	nc_read(0x59, 0x24, &r6, 1);
+-	nc_read(0x59, 0x2b, &r13, 1);
++	nc_pmic_write(0x23, l6 & 0x7f);
++	nc_read(0x59, 0x22, &r5, 1);
++	nc_read(0x59, 0x23, &r6, 1);
++	nc_read(0x59, 0x2a, &r13, 1);
+ 	notefe_pin(pins, 0x140, NC_SDA, 0, -1, -1);
+ 	notefe_pin(pins, 0x140, NC_SCL, 0, -1, -1);
+ 	printf("NOTEFE CAM: front: powered down: LDO5 %#x LDO6 %#x LDO13 %#x\n", r5, r6, r13);

@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index b7ef9df..0fb97c6 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2536,6 +2536,14 @@ notefe_cam_frame(vm_offset_t pins)
+ 	    "SysMMU ctrl %#x (was %#x)\n", notefe_rd(csis, 0x4), notefe_rd(csis, 0x24), notefe_rd(csis, 0x40), notefe_rd(csis, 0x44),
+ 	    notefe_rd(csis, 0x1000), notefe_rd(csis, 0x1004), notefe_rd(csis, 0x1010), notefe_rd(phy, 0x50),
+ 	    notefe_rd(pmu, 0x714), notefe_rd(mmu, 0), mmu_ctrl);
++	/* 0454: notefe_cam_tp=N: the sensor's test pattern (SMIA 0x0600: 1 solid colour, 2 colour bars, 3 fade, 4 PN9),
++	 * a check of layout, row order and Bayer order with no light needed; AE is skipped then */
++	uint32_t tp = 0;
++	PE_parse_boot_argn("notefe_cam_tp", &tp, sizeof(tp));
++	if (tp) {
++		nc_sensor_write(0x35, 0x0600, (uint16_t)tp, 16);
++		printf("NOTEFE CAM: frame: test pattern %u (0x0600 reads %#x)\n", tp, nc_sensor_rd16(0x0600));
++	}
+ 	/* stream */
+ 	nc_sensor_write(0x35, 0x0100, 1, 8);
+ 	if (notefe_cam_last == 6) {
+@@ -2582,6 +2590,9 @@ notefe_cam_frame(vm_offset_t pins)
+ 	 * then analogue gain 0x0204 (0x20 = 1x .. 0x200 = 16x), under the grouped hold 0x0104. Six steps, 200 ms each. */
+ 	uint32_t exp_l = 0x3fc, gain = 0x20, skip = 0;
+ 	PE_parse_boot_argn("notefe_cam_skip", &skip, sizeof(skip));        /* 0452: 1 no AE, 2 no picture (bisecting) */
++	if (tp) {
++		skip |= 1;
++	}
+ 	printf("NOTEFE CAM: frame: AE %s, picture %s\n", skip & 1 ? "skipped" : "on", skip & 2 ? "skipped" : "on");
+ 	for (unsigned step = 0; step < ((skip & 1) ? 0u : 6u); step++) {
+ 		uint64_t sum = 0;
+@@ -2610,6 +2621,9 @@ notefe_cam_frame(vm_offset_t pins)
+ 	}
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	delay(50000);
++	if (tp) {
++		nc_sensor_write(0x35, 0x0600, 0, 16);
++	}
+ 	/* receiver down, as found */
+ 	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);

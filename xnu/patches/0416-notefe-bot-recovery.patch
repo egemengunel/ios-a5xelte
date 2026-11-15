@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 2d9d1d2..28b8f98 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -441,6 +441,11 @@ notefe_hid_sysctl SYSCTL_HANDLER_ARGS
+ 		sweet_hid_key(a, b);
+ 		return 0;
+ 	}
++	if (cmd[0] == 'r' && notefe_parse_int(&p, &a) && a >= 0 && a <= 600) {
++		extern void herolte_twrp_soon(unsigned seconds);   /* Note FE 0416: back to TWRP when the bot is done */
++		herolte_twrp_soon((unsigned)a);
++		return 0;
++	}
+ 	return EINVAL;
+ }
+ 
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index d1ec83a..bfa8f8f 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3328,6 +3328,26 @@ hg_twrp_thread(void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Note FE (0416): the bot ends its run with "r SECONDS" on kern.notefe_hid (herolte_gl.c): recovery that much later
++ * (plus hg_twrp_thread's 12 s for the log's last flush), instead of waiting for the herotwrp timer. Once only.
++ */
++void herolte_twrp_soon(unsigned seconds);
++void
++herolte_twrp_soon(unsigned seconds)
++{
++	static int started;
++	thread_t thread;
++	if (started) {
++		return;
++	}
++	started = 1;
++	printf("NOTEFE: bot asked for recovery in %u s\n", seconds + 12);
++	if (kernel_thread_start(hg_twrp_thread, (void *)(uintptr_t)seconds, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /*
+  * Boot-arg herowifi=1, the first step of Wi-Fi: the BCM4359 is on PCIe channel 0 (FSYS1), as Linux's pci-exynos.c brings it up.
+  * In its order and with its timing: the chip gets #PERST high about 20 ms before the link starts, not half a minute, and Samsung's

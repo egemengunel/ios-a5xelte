@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 84024bd..61db52b 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1830,6 +1830,7 @@ nc_read(uint8_t slave, uint8_t reg, uint8_t *v, unsigned n)
+ }
+ 
+ static void notefe_cam_front_id(vm_offset_t pins);
++static void notefe_cam_csis_look(void);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1892,9 +1893,12 @@ notefe_cam_probe(int level)
+ 			printf("NOTEFE CAM: S2MPB02 LDO%u ctrl %#x: %s, about %u mV\n", i + 1, ldo[i], ldo[i] & 0x80 ? "ON" : "off", mv);
+ 		}
+ 	}
+-	if (level >= 3) {
++	if (level == 3) {
+ 		notefe_cam_front_id(pins);
+ 	}
++	if (level == 4) {
++		notefe_cam_csis_look();
++	}
+ }
+ 
+ /*
+@@ -2180,6 +2184,61 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	printf("NOTEFE CAM: front: powered down: LDO5 %#x LDO6 %#x LDO13 %#x\n", r5, r6, r13);
+ }
+ 
++/*
++ * Note FE (0444): camera stage 4, read only (kern.notefe_cam=4): what CSIS2 (the front's MIPI receiver, 0x14100000, in
++ * CAM1) needs and how it is found. CMU_TOP ACLK_CAM1_CSIS2_414 (mux 0x2e8, div 0x448, enable 0x8a8); CMU_CAM1
++ * (0x145d0000) the user muxes (BUS_264 0x20c, CSIS2_414 0x214, RXBYTECLKHS0_CSIS2 0x22c) and gates (BUS_264 0x814 bit 3
++ * = PCLK_CSIS2, CSIS2_414 0x820 bit 0, the PHY's byte clock 0x850), CMU_CAM1_LOCAL (0x141f0000) 0x814/0x820; the
++ * MIPI PHY control at 0x145f1050 (phy_cam1_csi, `samsung,mipi-phy-s4`) and its PMU isolation registers 0x714/0x718;
++ * the six fimc-is SysMMUs' MMU_CTRL/CFG/STATUS (0x0/0x4/0x8). CSIS2's own registers (version, control, interrupts,
++ * D-PHY, the four channels' config/resolution, frame counters, DMA0) only when its two gates read open.
++ */
++static void
++notefe_cam_csis_look(void)
++{
++	static vm_offset_t top, cam1, cam1l, phy, pmu, csis;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++		cam1 = ml_io_map(0x145d0000u, 0x1000);
++		cam1l = ml_io_map(0x141f0000u, 0x1000);
++		phy = ml_io_map(0x145f1000u, 0x1000);
++		pmu = ml_io_map(0x105c0000u, 0x1000);
++		csis = ml_io_map(0x14100000u, 0x2000);
++	}
++	if (!top || !cam1 || !cam1l || !phy || !pmu || !csis) {
++		printf("NOTEFE CAM: csis: map failed\n");
++		return;
++	}
++	printf("NOTEFE CAM: csis: TOP CAM1_CSIS2_414 mux %#x div %#x enable %#x\n", notefe_rd(top, 0x2e8), notefe_rd(top, 0x448),
++	    notefe_rd(top, 0x8a8));
++	uint32_t bus = notefe_rd(cam1, 0x814), acl = notefe_rd(cam1, 0x820);
++	printf("NOTEFE CAM: csis: CAM1 user muxes bus %#x csis2 %#x rxbyte0 %#x; gates bus %#x (pclk_csis2 %u) csis2 %#x (aclk %u) "
++	    "phy %#x; LOCAL %#x %#x\n", notefe_rd(cam1, 0x20c), notefe_rd(cam1, 0x214), notefe_rd(cam1, 0x22c), bus, (bus >> 3) & 1,
++	    acl, acl & 1, notefe_rd(cam1, 0x850), notefe_rd(cam1l, 0x814), notefe_rd(cam1l, 0x820));
++	printf("NOTEFE CAM: csis: PHY control %#x; PMU isolation 0x714 %#x 0x718 %#x\n", notefe_rd(phy, 0x50), notefe_rd(pmu, 0x714),
++	    notefe_rd(pmu, 0x718));
++	static const uint32_t mmus[] = { 0x140e0000u, 0x141b0000u, 0x141c0000u, 0x141d0000u, 0x141e0000u, 0x14280000u };
++	for (unsigned i = 0; i < 6; i++) {
++		vm_offset_t m = ml_io_map(mmus[i], 0x1000);
++		if (m) {
++			printf("NOTEFE CAM: csis: SysMMU %#x: MMU_CTRL %#x CFG %#x STATUS %#x VERSION %#x\n", mmus[i], notefe_rd(m, 0),
++			    notefe_rd(m, 4), notefe_rd(m, 8), notefe_rd(m, 0x34));
++		}
++	}
++	if (!((bus >> 3) & 1) || !(acl & 1)) {
++		printf("NOTEFE CAM: csis: CSIS2's gates read closed: its registers not read\n");
++		return;
++	}
++	static const uint16_t regs[] = { 0x0, 0x4, 0x8, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x30, 0x34, 0x38, 0x3c, 0x40, 0x44,
++		0x48, 0xc0, 0x100, 0x1000, 0x1004, 0x1008, 0x1010, 0x1030, 0x1034, 0x1040 };
++	char line[400];
++	int o = 0;
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && o < (int)sizeof(line) - 24; i++) {
++		o += snprintf(line + o, sizeof(line) - (size_t)o, " %#x=%#x", regs[i], notefe_rd(csis, regs[i]));
++	}
++	printf("NOTEFE CAM: csis: CSIS2:%s\n", line);
++}
++
+ static int
+ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -2192,7 +2251,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 3) {
++	if (value < 1 || value > 4) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
+@@ -2201,7 +2260,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID)");
++    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID, 4 CSIS2 look)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

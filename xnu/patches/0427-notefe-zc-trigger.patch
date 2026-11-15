@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index ef75282..a059a1c 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3559,8 +3559,27 @@ zc_window_locked(void)
+ 	}
+ 	hg_wr(zc_decon, 0x130, zc_wincon(level));
+ 	hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++	/* (0427) command mode (GLOBAL_CONTROL bit 8): the update goes out at the panel's next TE once the hardware
++	 * trigger is unmasked (Samsung's decon_reg_set_trigger(DECON_TRIG_ENABLE): HW_SW_TRIG_CONTROL bit 5 = 0). */
++	hg_wr(zc_decon, 0x70, hg_rd(zc_decon, 0x70) & ~(1u << 5));
+ 	zc_alpha_level = level;
+ 	if (!zc_on_window) {
++		/* The switch itself must be taken: if the DECON has not latched window 0's update in 50 ms, back to G1 and
++		 * no zero copy this boot (boots 23/24: it never was, and the panel kept the console's last frame). */
++		uint64_t t0 = mach_absolute_time(), limit;
++		nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
++		while ((hg_rd(zc_decon, 0x60) & 1u) && mach_absolute_time() - t0 < limit) {
++			delay(100);
++		}
++		printf("NOTEFE ZC: window switch: GLOBAL %#x update %#x trigger %#x line %#x win0 %#x\n", hg_rd(zc_decon, 0x0),
++		    hg_rd(zc_decon, 0x60), hg_rd(zc_decon, 0x70), hg_rd(zc_decon, 0x8c), hg_rd(zc_decon, 0x130));
++		if (hg_rd(zc_decon, 0x60) & 1u) {
++			hg_wr(zc_decon, 0x130, zc_win0);
++			hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++			zc_state = -1;
++			printf("NOTEFE ZC: window 0's switch not taken in 50 ms: G1 and the GPU copy for this boot\n");
++			return;
++		}
+ 		zc_on_window = true;
+ 		printf("NOTEFE ZC: window 0 on VGR0 (zero copy), brightness %u\n", level);
+ 	}
+@@ -3663,11 +3682,21 @@ notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
+ 		hg_wr(zc_vgr, 0x1c, 1);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		zc_window_locked();
++		if (!zc_on_window) {
++			lck_mtx_unlock(hg_mtx);
++			return false;           /* (0427) the switch was not taken: the copy shows this frame */
++		}
++		hg_wr(zc_decon, 0x70, hg_rd(zc_decon, 0x70) & ~(1u << 5));
+ 		while (hg_rd(zc_vgr, 0xb74) != (uint32_t)pa && mach_absolute_time() - t0 < limit) {
+ 			delay(50);
+ 		}
+ 		zc_late += hg_rd(zc_vgr, 0xb74) != (uint32_t)pa;
+ 		zc_wait_abs += mach_absolute_time() - t0;
++		if (zc_flips < 5) {
++			printf("NOTEFE ZC: after flip %llu: GLOBAL %#x update %#x trigger %#x line %#x win0 %#x VGR0 %#x/%#x\n",
++			    zc_flips + 1, hg_rd(zc_decon, 0x0), hg_rd(zc_decon, 0x60), hg_rd(zc_decon, 0x70), hg_rd(zc_decon, 0x8c),
++			    hg_rd(zc_decon, 0x130), hg_rd(zc_vgr, 0x0), hg_rd(zc_vgr, 0xb74));
++		}
+ 		if (++zc_flips <= 3 || zc_flips % 1800 == 0) {
+ 			uint64_t us;
+ 			absolutetime_to_nanoseconds(zc_wait_abs / zc_flips, &us);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4d62c0c..d31f0fa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -634,8 +634,8 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint32_t line = fb->fDecon ? (*(volatile uint32_t *)(fb->fDecon + 0x8c) & 0xffff) : 0;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* With two buffers the Mali never draws into the one being read: no waiting for the blank. */
+-	if (fb->fGpu && herolte_fb_two_buffers()) {
+-		line = 0;
++	if (fb->fGpu && (herolte_fb_two_buffers() || notefe_zc_active())) {
++		line = 0;       /* (0427) nor with zero copy: VGR0's address is double-buffered (ping-pong) */
+ 	}
+ #endif
+ 	if (line != 0 && line < SWEET_FB_PANEL_LINES && sender != NULL) {

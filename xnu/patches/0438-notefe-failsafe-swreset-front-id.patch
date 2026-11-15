@@ -1,0 +1,229 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 5e0d84d..2050d82 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1650,6 +1650,17 @@ notefe_safe_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++static void
++notefe_safe_to_twrp(__unused void *arg, __unused wait_result_t wr)
++{
++	printf("NOTEFE SAFE: the last reset was the watchdog: to recovery in 12 s\n");
++	ns_sleep_ms(12000);
++	notefe_wr(ns_pmu, 0x808, 0x12345678);
++	notefe_wr(ns_pmu, 0x80c, 0x12345674);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	notefe_wr(ns_pmu, 0x400, 1);                            /* SWRESET */
++}
++
+ void
+ notefe_safe_start(int level, uint32_t twrp_s)
+ {
+@@ -1668,6 +1679,15 @@ notefe_safe_start(int level, uint32_t twrp_s)
+ 	    (notefe_rd(ns_pmu, 0x404) >> 24) & 1, notefe_rd(ns_pmu, 0x408), notefe_rd(ns_pmu, 0x40c), notefe_rd(ns_pmu, 0x808),
+ 	    notefe_rd(ns_pmu, 0x80c), gate, (gate >> 9) & 1, (gate >> 8) & 1, notefe_rd(peris, 0x1800),
+ 	    notefe_rd(peris, 0x2410), notefe_rd(peris, 0x2414));
++	if ((notefe_rd(ns_pmu, 0x404) >> 24) & 1) {
++		/* wdt-1: after the watchdog's reset S-Boot boots iOS again (INFORM2/3 read 0 here): SWRESET with INFORM3 set
++		 * (hg_twrp_thread's proven exit) turns it into recovery. */
++		thread_t th;
++		if (kernel_thread_start(notefe_safe_to_twrp, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++			return;
++		}
++	}
+ 	if (!((gate >> 8) & 3)) {
+ 		printf("NOTEFE SAFE: watchdog clocks read as gated: not touched\n");
+ 		return;
+@@ -1809,6 +1829,8 @@ nc_read(uint8_t slave, uint8_t reg, uint8_t *v, unsigned n)
+ 	return false;
+ }
+ 
++static void notefe_cam_front_id(vm_offset_t pins);
++
+ static void
+ notefe_cam_probe(int level)
+ {
+@@ -1870,6 +1892,163 @@ notefe_cam_probe(int level)
+ 			printf("NOTEFE CAM: S2MPB02 LDO%u ctrl %#x: %s, about %u mV\n", i + 1, ldo[i], ldo[i] & 0x80 ? "ON" : "off", mv);
+ 		}
+ 	}
++	if (level >= 3) {
++		notefe_cam_front_id(pins);
++	}
++}
++
++/*
++ * Note FE (0438): camera stage 3, the front S5K4E6 powered and asked its model ID, then powered down (kern.notefe_cam=3).
++ * Samsung's order (fimc-is-module-4e6.c, SENSOR_SCENARIO_NORMAL, GPIO_SCENARIO_ON): standby low (gpc1-1), reset low
++ * (gpc0-4), VDDA_2.9V_VT (S2MPB02 LDO13 0x2b = 0x80 | 0x5c), VDDIO_1.8V_VT (LDO6 0x24 = 0x80 | 0x30), VDDD_1.2V_VT
++ * (LDO5 0x23 = 0x80 | 0x30), 1 ms, reset high, 40 us, MCLK (gpk0-2) to function 2. The sensor's I2C (sensor_i2c_addr
++ * 0x6a, 8-bit: 0x35) is the ISP's own (pins gpc2-2 SDA, gpc2-3 SCL, function 2), which its firmware drives: here the two
++ * pins are bit-banged instead (released = input with pull-up, low = output 0), about 100 kHz. Read: 0x0000 (model ID,
++ * 16 bits, 16-bit register addresses), 0x0002 (revision), 0x0005 (frame count). Power-down: the reverse, each LDO's
++ * voltage bits kept as found, enable bit off.
++ */
++#define NC_SDA  2
++#define NC_SCL  3
++static vm_offset_t nc_pins;
++
++static void
++nc_line(unsigned pin, int high)
++{
++	notefe_pin(nc_pins, 0x140, pin, high ? 0 : 1, 3, high ? -1 : 0);       /* input (pulled up) or output low */
++	delay(5);
++}
++
++static int
++nc_sda(void)
++{
++	return (notefe_rd(nc_pins, 0x144) >> NC_SDA) & 1;
++}
++
++static void
++nc_start(void)
++{
++	nc_line(NC_SDA, 1); nc_line(NC_SCL, 1); nc_line(NC_SDA, 0); nc_line(NC_SCL, 0);
++}
++
++static void
++nc_stop(void)
++{
++	nc_line(NC_SDA, 0); nc_line(NC_SCL, 1); nc_line(NC_SDA, 1);
++}
++
++static bool
++nc_byte_out(uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		nc_line(NC_SDA, (b >> i) & 1);
++		nc_line(NC_SCL, 1);
++		nc_line(NC_SCL, 0);
++	}
++	nc_line(NC_SDA, 1);
++	nc_line(NC_SCL, 1);
++	bool ack = !nc_sda();
++	nc_line(NC_SCL, 0);
++	return ack;
++}
++
++static uint8_t
++nc_byte_in(bool ack)
++{
++	uint8_t b = 0;
++	nc_line(NC_SDA, 1);
++	for (int i = 7; i >= 0; i--) {
++		nc_line(NC_SCL, 1);
++		b = (uint8_t)(b << 1 | nc_sda());
++		nc_line(NC_SCL, 0);
++	}
++	nc_line(NC_SDA, ack ? 0 : 1);
++	nc_line(NC_SCL, 1);
++	nc_line(NC_SCL, 0);
++	nc_line(NC_SDA, 1);
++	return b;
++}
++
++/* 16-bit register address, n bytes back; false if a byte is not acknowledged */
++static bool
++nc_sensor_read(uint8_t addr7, uint16_t reg, uint8_t *v, unsigned n)
++{
++	nc_start();
++	bool ok = nc_byte_out((uint8_t)(addr7 << 1)) && nc_byte_out((uint8_t)(reg >> 8)) && nc_byte_out((uint8_t)reg);
++	if (ok) {
++		nc_start();
++		ok = nc_byte_out((uint8_t)(addr7 << 1 | 1));
++		for (unsigned i = 0; ok && i < n; i++) {
++			v[i] = nc_byte_in(i + 1 < n);
++		}
++	}
++	nc_stop();
++	return ok;
++}
++
++static bool
++nc_pmic_write(uint8_t reg, uint8_t v)
++{
++	uint8_t b[2] = { reg, v };
++	return nc_message(0x59, false, b, 2, true);
++}
++
++static void
++notefe_cam_front_id(vm_offset_t pins)
++{
++	nc_pins = pins;
++	uint8_t l5 = 0, l6 = 0, l13 = 0;
++	if (!nc_read(0x59, 0x23, &l5, 1) || !nc_read(0x59, 0x24, &l6, 1) || !nc_read(0x59, 0x2b, &l13, 1)) {
++		printf("NOTEFE CAM: front: the S2MPB02 does not answer, nothing powered\n");
++		return;
++	}
++	printf("NOTEFE CAM: front: LDO5 %#x LDO6 %#x LDO13 %#x as found; gpc2 con %#x\n", l5, l6, l13, notefe_rd(pins, 0x140));
++	notefe_pin(pins, 0x120, 1, 1, 0, 0);            /* standby low */
++	notefe_pin(pins, 0x100, 4, 1, 0, 0);            /* reset low */
++	nc_line(NC_SDA, 1);
++	nc_line(NC_SCL, 1);
++	bool p13 = nc_pmic_write(0x2b, 0x80 | 0x5c);
++	bool p6 = nc_pmic_write(0x24, 0x80 | 0x30);
++	bool p5 = nc_pmic_write(0x23, 0x80 | 0x30);
++	delay(1000);
++	uint8_t r5 = 0, r6 = 0, r13 = 0;
++	nc_read(0x59, 0x23, &r5, 1);
++	nc_read(0x59, 0x24, &r6, 1);
++	nc_read(0x59, 0x2b, &r13, 1);
++	printf("NOTEFE CAM: front: VDDA 2.9 V (LDO13) %s %#x, VDDIO 1.8 V (LDO6) %s %#x, VDDD 1.2 V (LDO5) %s %#x\n",
++	    p13 ? "on" : "FAILED", r13, p6 ? "on" : "FAILED", r6, p5 ? "on" : "FAILED", r5);
++	notefe_pin(pins, 0x100, 4, 1, 0, 1);            /* reset high */
++	delay(40);
++	notefe_pin(pins, 0x180, 2, 2, -1, -1);          /* MCLK out */
++	delay(5000);
++	printf("NOTEFE CAM: front: reset high, MCLK on (gpk0 con %#x); the lines idle SDA %u SCL %u\n", notefe_rd(pins, 0x180),
++	    nc_sda(), (notefe_rd(pins, 0x144) >> NC_SCL) & 1);
++	static const uint8_t addrs[] = { 0x35, 0x10, 0x2d, 0x36 };
++	for (unsigned a = 0; a < sizeof(addrs); a++) {
++		uint8_t id[2] = { 0, 0 }, rev = 0, fc = 0;
++		if (nc_sensor_read(addrs[a], 0x0000, id, 2)) {
++			nc_sensor_read(addrs[a], 0x0002, &rev, 1);
++			nc_sensor_read(addrs[a], 0x0005, &fc, 1);
++			printf("NOTEFE CAM: front: THE SENSOR ANSWERS at %#x: model ID %#06x, revision %#x, frame count %#x\n",
++			    addrs[a], id[0] << 8 | id[1], rev, fc);
++			break;
++		}
++		printf("NOTEFE CAM: front: no answer at %#x\n", addrs[a]);
++	}
++	/* down again, the reverse */
++	notefe_pin(pins, 0x180, 2, 0, -1, -1);
++	notefe_pin(pins, 0x100, 4, 1, 0, 0);
++	notefe_pin(pins, 0x120, 1, 1, 0, 0);
++	nc_pmic_write(0x23, l5 & 0x7f);
++	delay(2000);
++	nc_pmic_write(0x2b, l13 & 0x7f);
++	delay(2000);
++	nc_pmic_write(0x24, l6 & 0x7f);
++	nc_read(0x59, 0x23, &r5, 1);
++	nc_read(0x59, 0x24, &r6, 1);
++	nc_read(0x59, 0x2b, &r13, 1);
++	notefe_pin(pins, 0x140, NC_SDA, 0, -1, -1);
++	notefe_pin(pins, 0x140, NC_SCL, 0, -1, -1);
++	printf("NOTEFE CAM: front: powered down: LDO5 %#x LDO6 %#x LDO13 %#x\n", r5, r6, r13);
+ }
+ 
+ static int
+@@ -1884,7 +2063,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 2) {
++	if (value < 1 || value > 3) {
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
+@@ -1893,7 +2072,7 @@ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read)");
++    NULL, 0, notefe_cam_sysctl, "I", "Note FE: camera (1 read only, 2 + the S2MPB02 PMIC read, 3 + front sensor ID)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

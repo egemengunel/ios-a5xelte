@@ -1,0 +1,95 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 09bd50b..b7ef9df 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2375,38 +2375,54 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+ #define NC_PH   (NC_H / 2)
+ static uint8_t *nc_pic;
+ 
++/*
++ * 0453: no big mapping (0450's ml_io_unmap of io_submap pieces and 0451's 10 MB ml_io_map_unmappable both hung the
++ * boot). One permanent 1 MB window at 0xd1200000 stays mapped; while the sensor streams, DMA0's eight frame pointers
++ * are moved back a slice at a time (base = window - k x slice, a slice being whole rows) so that rows
++ * [k x slice, (k + 1) x slice) of the next frames land in the window, and those rows are binned into the picture.
++ * The frames' other rows go to the rest of the camera ION range (0xd0800000-0xd1c00000, below 0xd8000000).
++ */
++#define NC_PWIN 0xd1200000u
+ static void
+-nc_make_picture(void)
++nc_make_picture(vm_offset_t csis)
+ {
++	static vm_offset_t w;
+ 	printf("NOTEFE CAM: picture: allocating %u bytes\n", NC_PW * NC_PH);
+ 	if (!nc_pic) {
+ 		nc_pic = kalloc_data(NC_PW * NC_PH, Z_WAITOK);
+ 	}
+-	printf("NOTEFE CAM: picture: buffer %p; mapping the frame\n", nc_pic);
+-	if (!nc_pic) {
+-		return;
++	if (!w) {
++		w = ml_io_map(NC_PWIN, 0x100000);
+ 	}
+-	/* 0451: one mapping of the whole frame from kernel_map (ml_io_map_unmappable), which ml_io_unmap can free: 0450
+-	 * freed ml_io_map's io_submap (KMA_PERMANENT) pieces from kernel_map, and the boot hung (the watchdog's reset). */
+-	const uint32_t row = NC_W * 2;
+-	vm_offset_t m = ml_io_map_unmappable(NC_BUF, NC_H * row, 0x7);   /* VM_WIMG_IO (arm memory_types.h) */
+-	if (!m) {
+-		printf("NOTEFE CAM: picture: map failed\n");
++	if (!nc_pic || !w) {
++		printf("NOTEFE CAM: picture: no buffer (%p) or window (%#lx)\n", nc_pic, (unsigned long)w);
+ 		return;
+ 	}
+-	for (uint32_t y = 0; y < NC_H; y++) {
+-		if ((y & 3) >= 2) {
+-			continue;                   /* rows 0,1 of every 4: one 2x2 cell row in two */
+-		}
+-		volatile uint16_t *src = (volatile uint16_t *)(m + y * row);
+-		uint8_t *dst = nc_pic + ((y >> 2) * 2 + (y & 1)) * NC_PW;
+-		for (uint32_t x = 0; x < NC_W; x += 4) {
+-			dst[x / 2] = (uint8_t)((src[x] & 0x3ff) >> 2);
+-			dst[x / 2 + 1] = (uint8_t)((src[x + 1] & 0x3ff) >> 2);
++	const uint32_t row = NC_W * 2, rows_per = 0x100000 / row, slice = rows_per * row;
++	unsigned slices = 0;
++	for (uint32_t y0 = 0; y0 < NC_H; y0 += rows_per, slices++) {
++		uint32_t base = NC_PWIN - (y0 / rows_per) * slice;
++		for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++			notefe_wr(csis, a, base);
++		}
++		delay(140000);                          /* four frames at ~30 a second */
++		uint32_t n = MIN(rows_per, NC_H - y0);
++		for (uint32_t y = y0; y < y0 + n; y++) {
++			if ((y & 3) >= 2) {
++				continue;
++			}
++			volatile uint16_t *src = (volatile uint16_t *)(w + (y - y0) * row);
++			uint8_t *dst = nc_pic + ((y >> 2) * 2 + (y & 1)) * NC_PW;
++			for (uint32_t x = 0; x < NC_W; x += 4) {
++				dst[x / 2] = (uint8_t)((src[x] & 0x3ff) >> 2);
++				dst[x / 2 + 1] = (uint8_t)((src[x + 1] & 0x3ff) >> 2);
++			}
+ 		}
+ 	}
+-	ml_io_unmap(m, NC_H * row);
+-	printf("NOTEFE CAM: picture: %u x %u Bayer, 8 bits, ready (kern.notefe_cam_pic)\n", NC_PW, NC_PH);
++	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++		notefe_wr(csis, a, NC_BUF);
++	}
++	printf("NOTEFE CAM: picture: %u x %u Bayer, 8 bits, from %u slices: ready (kern.notefe_cam_pic)\n", NC_PW, NC_PH, slices);
+ }
+ 
+ static int
+@@ -2589,11 +2605,11 @@ notefe_cam_frame(vm_offset_t pins)
+ 		nc_sensor_write(0x35, 0x0104, 0, 8);
+ 		delay(200000);
+ 	}
+-	nc_sensor_write(0x35, 0x0100, 0, 8);
+-	delay(50000);
+ 	if (!(skip & 2)) {
+-		nc_make_picture();
++		nc_make_picture(csis);
+ 	}
++	nc_sensor_write(0x35, 0x0100, 0, 8);
++	delay(50000);
+ 	/* receiver down, as found */
+ 	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);

@@ -1,0 +1,464 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 77886eb..9ac25b0 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1941,6 +1941,8 @@ herolte_fb_two_buffers(void)
+  */
+ /* Note FE (0419): the panel's brightness, 255 = as drawn. Set by kern.notefe_brightness and the backlight service. */
+ static volatile uint32_t notefe_bright_level = 255;
++static bool zc_on_window;                /* (0425, below) */
++static void zc_window_locked(void);
+ 
+ void notefe_brightness_set(uint32_t level, const char *why);
+ void
+@@ -1957,6 +1959,13 @@ notefe_brightness_set(uint32_t level, const char *why)
+ 		printf("NOTEFE BRIGHT: %u -> %u (%s)\n", notefe_bright_level, level, why);
+ 	}
+ 	notefe_bright_level = level;
++	if (zc_on_window) {
++		lck_mtx_lock(hg_mtx);
++		if (zc_on_window) {
++			zc_window_locked();     /* (0425) the window's plane alpha, at once: a still screen gets no frame */
++		}
++		lck_mtx_unlock(hg_mtx);
++	}
+ }
+ 
+ uint32_t notefe_brightness_get(void);
+@@ -3514,6 +3523,184 @@ notefe_zc_test_thread(__unused void *arg, __unused wait_result_t wr)
+ 	notefe_zc_dump(vgr, decon, "back on G1");
+ }
+ 
++/*
++ * Note FE (0425): zero-copy display. backboardd's full-screen surfaces live in the 16 MiB at 0xa0000000 (the default
++ * one and up to three more: SweetSurface.cpp), so the display can read them: VGR0 (the 8890's scaling channel, set up
++ * as the 0424 test did) reads the frame iOS just finished and scales it to the panel; window 0 is switched to VGR0
++ * (CHMAP 5) once and back to G1 (CHMAP 0) when a frame cannot be shown that way. No GPU copy (4.7 ms a frame), no
++ * GPU time taken from iOS's own drawing. A flip writes VGR0's address with a ping-pong update and waits (at most
++ * ~20 ms) until the display has latched it (0xb74), so iOS (whose SwapEnd waits for this) never draws into the
++ * surface being shown. Brightness is the window's plane alpha over the black background (Samsung's wincon():
++ * ALPHA0 = level, ALPHA1 = 0, PD_FUNC_LEGACY), not the copy's blend. Boot-arg notefe_zc=0: the GPU copy as before.
++ */
++static vm_offset_t zc_vgr, zc_decon;
++static int zc_state;                    /* 0 not set up, 1 VGR0 ready, -1 off */
++static bool zc_on_window;               /* window 0 on VGR0 */
++static uint32_t zc_win0;                /* window 0 as S-Boot left it (G1) */
++static uint32_t zc_bpr, zc_w, zc_h, zc_alpha_level = 256;
++static uint64_t zc_flips, zc_late, zc_off_count, zc_wait_abs;
++
++static uint32_t
++zc_wincon(uint32_t level)
++{
++	uint32_t v = (zc_win0 & ~((7u << 12) | 0xff00ff00u | (7u << 4) | (1u << 6))) | (5u << 12);
++	if (level >= 255) {
++		return v | (0xffu << 24) | (1u << 8);                   /* ALPHA1 0xff, PD_FUNC_COPY: as S-Boot's */
++	}
++	return v | (level << 16) | (0xdu << 8);                         /* ALPHA0 = level, ALPHA1 0, PD_FUNC_LEGACY */
++}
++
++static void
++zc_window_locked(void)
++{
++	uint32_t level = notefe_bright_level;
++	if (zc_on_window && level == zc_alpha_level) {
++		return;
++	}
++	hg_wr(zc_decon, 0x130, zc_wincon(level));
++	hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++	zc_alpha_level = level;
++	if (!zc_on_window) {
++		zc_on_window = true;
++		printf("NOTEFE ZC: window 0 on VGR0 (zero copy), brightness %u\n", level);
++	}
++}
++
++static bool
++zc_setup_locked(uint32_t bpr, uint32_t w, uint32_t h)
++{
++	if (zc_state == 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("notefe_zc", &on, sizeof(on));
++		zc_state = -1;
++		zc_vgr = on ? ml_io_map(0x13e03000u, 0x1000) : 0;
++		zc_decon = on ? ml_io_map(HG_DECON_F_PA, 0x1000) : 0;
++		zc_win0 = zc_decon ? hg_rd(zc_decon, 0x130) : 0;
++		if (!zc_vgr || !zc_decon || ((zc_win0 >> 12) & 7) != 0 || !(zc_win0 & 1)) {
++			printf("NOTEFE ZC: %s\n", on ? "window 0 not as S-Boot left it: GPU copy" : "off (notefe_zc=0)");
++			return false;
++		}
++		hg_wr(zc_vgr, 0x00, hg_rd(zc_vgr, 0x00) | (1u << 24));
++		unsigned n = 0;
++		while ((hg_rd(zc_vgr, 0x00) & (1u << 24)) && n++ < 10000) {
++			delay(10);
++		}
++		if (hg_rd(zc_vgr, 0x00) & (1u << 24)) {
++			printf("NOTEFE ZC: VGR0 reset did not finish: GPU copy\n");
++			return false;
++		}
++		hg_wr(zc_vgr, 0x00, hg_rd(zc_vgr, 0x00) | (1u << 16));
++		hg_wr(zc_vgr, 0x04, (hg_rd(zc_vgr, 0x04) & ~0x36u) | 1u);
++		hg_wr(zc_vgr, 0x60, 0x44444444u);
++		hg_wr(zc_vgr, 0x64, 0x44444444u);
++		hg_wr(zc_vgr, 0xa54, 0x3f);
++		hg_wr(zc_vgr, 0x0c, 0xffu << 24);
++		vm_offset_t g1 = ml_io_map(HG_IDMA_G1_PA, 0x1000);
++		hg_wr(zc_vgr, 0x08, (g1 ? hg_rd(g1, 0x08) : 0xff800000u) & ~((31u << 11) | (1u << 3) | (1u << 4) | (7u << 8)));
++		for (unsigned i = 0; i < 9; i++) {
++			for (unsigned j = 0; j < 8; j++) {
++				for (unsigned k = 0; k < 2; k++) {
++					hg_wr(zc_vgr, 0x290 + i * 4 + j * 0x24 + k * 0x200, (uint32_t)(int32_t)notefe_hcoef[i][j]);
++				}
++			}
++			for (unsigned j = 0; j < 4; j++) {
++				for (unsigned k = 0; k < 2; k++) {
++					hg_wr(zc_vgr, 0x200 + i * 4 + j * 0x24 + k * 0x200, (uint32_t)(int32_t)notefe_vcoef[i][j]);
++				}
++			}
++		}
++		hg_wr(zc_vgr, 0x14, 0);
++		hg_wr(zc_vgr, 0x5b0, 0);
++		hg_wr(zc_vgr, 0x5b4, 0);
++		hg_wr(zc_vgr, 0x5b8, 0);
++		hg_wr(zc_vgr, 0x5bc, 0);
++		hg_wr(zc_vgr, 0x2c, (HG_PANEL_H << 16) | HG_PANEL_W);
++		hg_wr(zc_vgr, 0xa48, HG_PANEL_W * HG_PANEL_H);
++		hg_wr(zc_vgr, 0x94, 0);
++		zc_state = 1;
++		printf("NOTEFE ZC: VGR0 set up for zero copy (window 0 was %#x)\n", zc_win0);
++	}
++	if (zc_state != 1) {
++		return false;
++	}
++	if (bpr != zc_bpr || w != zc_w || h != zc_h) {
++		if (w == 0 || h == 0 || w * 2 < HG_PANEL_W || h * 2 < HG_PANEL_H || w > HG_PANEL_W || h > HG_PANEL_H ||
++		    (bpr & 3) || bpr / 4 < w) {
++			return false;                           /* beyond the scaler's 2x (vpp_check_scale_ratio) */
++		}
++		hg_wr(zc_vgr, 0x10, (h << 16) | (bpr / 4));
++		hg_wr(zc_vgr, 0x18, (h << 16) | w);
++		hg_wr(zc_vgr, 0x44, (w << 20) / HG_PANEL_W);
++		hg_wr(zc_vgr, 0x48, (h << 20) / HG_PANEL_H);
++		zc_bpr = bpr;
++		zc_w = w;
++		zc_h = h;
++	}
++	return true;
++}
++
++bool notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h);
++bool
++notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h)
++{
++	if (zc_state < 0 || pa == 0 || pa + (uint64_t)bpr * h > 0x100000000ull) {
++		return false;
++	}
++	lck_mtx_lock(hg_mtx);
++	bool ok = zc_setup_locked(bpr, w, h);
++	if (ok) {
++		uint64_t t0 = mach_absolute_time(), limit;
++		nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &limit);
++		hg_wr(zc_vgr, 0x74, (uint32_t)pa);
++		hg_wr(zc_vgr, 0x1c, 1);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		zc_window_locked();
++		while (hg_rd(zc_vgr, 0xb74) != (uint32_t)pa && mach_absolute_time() - t0 < limit) {
++			delay(50);
++		}
++		zc_late += hg_rd(zc_vgr, 0xb74) != (uint32_t)pa;
++		zc_wait_abs += mach_absolute_time() - t0;
++		if (++zc_flips <= 3 || zc_flips % 1800 == 0) {
++			uint64_t us;
++			absolutetime_to_nanoseconds(zc_wait_abs / zc_flips, &us);
++			printf("NOTEFE ZC: flip %llu to %#llx (%ux%u, %u a row): %llu not latched in 20 ms, %llu us to latch on "
++			    "average, %llu falls back to the copy; VGR0 irq %#x\n", zc_flips, pa, w, h, bpr, zc_late, us / 1000,
++			    zc_off_count, hg_rd(zc_vgr, 0x04));
++		}
++	}
++	lck_mtx_unlock(hg_mtx);
++	return ok;
++}
++
++/* A frame that is not shown by VGR0 (or the panel going off): window 0 back on G1, which the copy fills. */
++void notefe_zc_off(void);
++void
++notefe_zc_off(void)
++{
++	if (!zc_on_window) {
++		return;
++	}
++	lck_mtx_lock(hg_mtx);
++	if (zc_on_window) {
++		hg_wr(zc_decon, 0x130, zc_win0);
++		hg_wr(zc_decon, 0x60, hg_rd(zc_decon, 0x60) | 1u);
++		zc_on_window = false;
++		zc_alpha_level = 256;
++		zc_bpr = 0;
++		if (++zc_off_count <= 10 || zc_off_count % 100 == 0) {
++			printf("NOTEFE ZC: window 0 back on G1 (%llu times)\n", zc_off_count);
++		}
++	}
++	lck_mtx_unlock(hg_mtx);
++}
++
++bool notefe_zc_active(void);
++bool
++notefe_zc_active(void)
++{
++	return zc_on_window;
++}
++
+ /*
+  * Note FE (0416): the bot ends its run with "r SECONDS" on kern.notefe_hid (herolte_gl.c): recovery that much later
+  * (plus hg_twrp_thread's 12 s for the log's last flush), instead of waiting for the herotwrp timer. Once only.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 573c379..0ec6ed7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -74,6 +74,63 @@ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, u
+ /* Two panel buffers (herofb2): the Mali draws into the one not shown; the CPU writes only the first, shown first. */
+ extern "C" bool herolte_fb_two_buffers(void);
+ extern "C" void herolte_fb_primary(void);
++extern "C" bool notefe_zc_flip(uint64_t pa, uint32_t bpr, uint32_t w, uint32_t h);
++extern "C" void notefe_zc_off(void);
++extern "C" bool notefe_zc_active(void);
++
++/*
++ * (0425) backboardd's full-screen surfaces in memory the display can read: three 4 MiB slots after the default
++ * surface in the 16 MiB at 0xa0000000 (notefe-ram-banks.py keeps it out of the kernel's RAM). SweetSurface.cpp asks
++ * here when backboardd makes a surface of the presented size; a slot is free again once its surface is gone.
++ */
++static uint32_t notefe_zc_pool_w, notefe_zc_pool_h;
++static uint32_t notefe_zc_slot_id[3];
++static bool notefe_zc_slot_pending[3];
++static int notefe_zc_pool_on = -1;
++
++extern "C" uint64_t
++notefe_zc_pool_take(uint32_t w, uint32_t h, uint32_t fmt, uint32_t planes, uint32_t size)
++{
++	if (notefe_zc_pool_on < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("notefe_zc", &on, sizeof(on));
++		notefe_zc_pool_on = on ? 1 : 0;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	if (!notefe_zc_pool_on || notefe_zc_pool_w == 0 || w != notefe_zc_pool_w || h != notefe_zc_pool_h ||
++	    fmt != 0x42475241u /* BGRA */ || planes != 0 || size > 0x400000 || strcmp(name, "backboardd") != 0) {
++		return 0;
++	}
++	for (unsigned k = 0; k < 3; k++) {
++		if (notefe_zc_slot_pending[k]) {
++			continue;
++		}
++		uint32_t id = notefe_zc_slot_id[k];
++		SweetSurface *alive = id ? sweet_surface_copy(id) : NULL;
++		if (alive != NULL) {
++			alive->release();
++			continue;
++		}
++		notefe_zc_slot_pending[k] = true;
++		notefe_zc_slot_id[k] = 0;
++		uint64_t pa = 0xa0400000ULL + (uint64_t)k * 0x400000;
++		IOLog("NOTEFE ZC: backboardd's %ux%u surface in display memory at %#llx\n", w, h, pa);
++		return pa;
++	}
++	IOLog("NOTEFE ZC: backboardd's %ux%u surface: no display slot free\n", w, h);
++	return 0;
++}
++
++extern "C" void
++notefe_zc_pool_bind(uint64_t pa, uint32_t id)
++{
++	unsigned k = (unsigned)((pa - 0xa0400000ULL) / 0x400000);
++	if (pa >= 0xa0400000ULL && k < 3) {
++		notefe_zc_slot_id[k] = id;
++		notefe_zc_slot_pending[k] = false;
++	}
++}
+ extern "C" volatile uint64_t herolte_screen_off_at;    /* bsd/dev/herolte_gpu.c (0330) */
+ extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c, sysctl kern.timer_coalescing_enabled */
+ #endif
+@@ -159,6 +216,7 @@ public:
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint64_t      fSwapSeq, fPendingSeq, fShownSeq;     /* (0425) swaps given, the pending one, the last one shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -176,7 +234,7 @@ public:
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+-	void swap(const uint8_t *rec);
++	uint64_t swap(const uint8_t *rec);
+ 	uint64_t present(const uint8_t *rec);
+ 	uint64_t scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
+@@ -401,7 +459,11 @@ AppleCLCD::start(IOService *provider)
+ 	/* Scaled, what CoreAnimation draws into the default surface must not land on the panel unscaled (a small copy of
+ 	 * the screen in its corner): the surface has its own memory, free in the first bank, and is presented like any other. */
+ 	if (fScaled) {
+-		fSurface = sweet_surface_create_physical(0xa0000000ULL, fLogicalW, fLogicalH, (fLogicalW * 4 + 63) & ~63u,
++		/* (0425) rows 256-byte aligned, as CoreAnimation's own display surfaces (3072 for 750): the scaler
++		 * keeps one row length for both */
++		notefe_zc_pool_w = fLogicalW;
++		notefe_zc_pool_h = fLogicalH;
++		fSurface = sweet_surface_create_physical(0xa0000000ULL, fLogicalW, fLogicalH, (fLogicalW * 4 + 255) & ~255u,
+ 		    SWEET_FB_FORMAT_BGRA);
+ 		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 		fPixels = panel != NULL ? panel->kernelAddress() : 0;
+@@ -591,8 +653,10 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	show = show && mach_absolute_time() >= sweet_fb_hold_until;
+ #endif
++	uint64_t seq = 0;
+ 	if (show) {
+ 		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		seq = fb->fPendingSeq;
+ 		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -604,6 +668,10 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 		uint64_t gap = fb->fVsyncCount - fb->fLastShown;
+ 		fb->fGaps[gap <= 1 ? 0 : gap >= 4 ? 3 : gap - 1] += gap <= 30 ? 1 : 0;
+ 		fb->fLastShown = fb->fVsyncCount;
++		IOLockLock(fb->fLock);
++		fb->fShownSeq = seq;                    /* (0425) SwapEnd waits for this with zero copy */
++		IOLockWakeup(fb->fLock, &fb->fShownSeq, false);
++		IOLockUnlock(fb->fLock);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		fb->fPerfFrames++;
+ 		fb->fPerfBytes += bytes;
+@@ -645,6 +713,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockUnlock(fb->fLock);
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 		if (step == 0) {
++			notefe_zc_off();        /* (0425) the fade is drawn into G1's buffer */
+ 			herolte_fb_primary();
+ 		}
+ #endif
+@@ -879,11 +948,12 @@ sweet_fb_copy_rows(uintptr_t dst, uint64_t dstStride, uintptr_t src, uint64_t sr
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
+-void
++uint64_t
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	uint64_t seq = fPendingSeq = ++fSwapSeq;
+ 	fSwaps++;
+ 	fOverwritten += fDirty ? 1 : 0;
+ 	fDirty = true;
+@@ -913,6 +983,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	return seq;
+ }
+ 
+ /*
+@@ -1053,13 +1124,26 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* (0425) zero copy: a whole frame in memory the display can read goes to VGR0 as it is. */
++		if (src != 0 && bpe == 4 && fGpu && dx == 0 && dy == 0 && sx == 0 && sy == 0 && !fPowerOff &&
++		    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH && s->pixelFormat == SWEET_FB_FORMAT_BGRA) {
++			IOByteCount seg = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
++			if (pa != 0 && seg >= (IOByteCount)s->bytesPerRow * (IOByteCount)h &&
++			    notefe_zc_flip(pa, s->bytesPerRow, (uint32_t)w, (uint32_t)h)) {
++				s->release();
++				continue;
++			}
++		}
+ 		if (src != 0 && bpe == 4 && fGpu && dx == 0 && dy == 0 &&
+ 		    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH && gpuPresent(s, sx, sy, w, h)) {
++			notefe_zc_off();
+ 			copied += (uint64_t)fWidth * fHeight * 4;
+ 			s->release();
+ 			continue;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			notefe_zc_off();
+ 			herolte_fb_primary();   /* the CPU writes the first buffer: shown first (herofb2) */
+ 		}
+ #endif
+@@ -1347,7 +1431,26 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
+-		fFB->swap(rec);
++		uint64_t seq = fFB->swap(rec);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/*
++		 * (0425) Zero copy: the display reads the surface itself, so CoreAnimation must not draw into the one it
++		 * gave before until this frame has replaced it on the panel (at most a refresh; 40 ms at worst).
++		 */
++		if (notefe_zc_active()) {
++			uint64_t deadline;
++			clock_interval_to_deadline(40, kMillisecondScale, &deadline);
++			IOLockLock(fFB->fLock);
++			while (fFB->fShownSeq < seq) {
++				if (IOLockSleepDeadline(fFB->fLock, &fFB->fShownSeq, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++					break;
++				}
++			}
++			IOLockUnlock(fFB->fLock);
++		}
++#else
++		(void)seq;
++#endif
+ 		break;
+ 	}
+ 	case kSweetFBGetID:
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2b6ce2d..bc04ace 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -26,6 +26,10 @@
+  * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++extern "C" uint64_t notefe_zc_pool_take(uint32_t w, uint32_t h, uint32_t fmt, uint32_t planes, uint32_t size);
++extern "C" void notefe_zc_pool_bind(uint64_t pa, uint32_t id);
++#endif
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -763,12 +767,29 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	if (ret == kIOReturnSuccess) {
+ #endif
+ 		IOBufferMemoryDescriptor *mem = NULL;
+-		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
++		bool zc_done = false;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* (0425) backboardd's full-screen surfaces in memory the display can read (SweetFramebuffer.cpp). */
++		uint64_t zc_pa = notefe_zc_pool_take(s->width, s->height, s->pixelFormat, s->planeCount, s->allocSize);
++		if (zc_pa != 0) {
++			s->memory = IOMemoryDescriptor::withPhysicalAddress(zc_pa, s->allocSize, kIODirectionInOut);
++			s->mapCache = kIOMapWriteCombineCache;
++			zc_done = true;
++			if (s->memory == NULL || !sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++				notefe_zc_pool_bind(zc_pa, 0);
++			} else {
++				notefe_zc_pool_bind(zc_pa, s->id);
++			}
++		}
++#endif
++		if (!zc_done && (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+ 		}
+-		if (mem == NULL) {
++		if (zc_done) {
++		} else if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+ 		} else {

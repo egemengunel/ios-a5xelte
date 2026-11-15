@@ -1,0 +1,137 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: Sandbox stand-in answers container-path queries with the HOME seen at exec (extensions)
+
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index d799cb7..2d9d1d2 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -22,6 +22,7 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/sysctl.h>
+ #include <sys/kauth.h>
++#include <kern/locks.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+@@ -316,6 +317,67 @@ herolte_gl_env_base(const char *path, int pid, const char **extra, int max)
+ 	    launch, hgl_pid, hgl_mode);
+ 	return n;
+ }
++/*
++ * Note FE 0412: container paths. The Sandbox stand-in answered sandbox_container_path_for_pid/_audit_token (op 4) with
++ * ENOENT, so PlugInKit refused every extension ("plugin has invalid sandbox or container: error 2": widgets, intents,
++ * PhotosFileProvider). At exec, a HOME under /Containers/ (RunningBoard sets it to the data container) is kept per pid.
++ */
++#define HCONT_SLOTS 192
++static struct {
++	int pid;
++	char path[208];
++} hcont[HCONT_SLOTS];
++static unsigned hcont_next;
++static LCK_GRP_DECLARE(hcont_grp, "notefe-container");
++static LCK_SPIN_DECLARE(hcont_spin, &hcont_grp);
++
++void herolte_note_container(int pid, const char *env, size_t len);
++void
++herolte_note_container(int pid, const char *env, size_t len)
++{
++	const char *end = env + len;
++	for (const char *e = env; e < end && *e;) {
++		size_t l = strnlen(e, (size_t)(end - e));
++		if (l > 5 && strncmp(e, "HOME=", 5) == 0 && strnstr(e, "/Containers/", l) != NULL && l - 5 < sizeof(hcont[0].path)) {
++			lck_spin_lock(&hcont_spin);
++			unsigned slot = HCONT_SLOTS;
++			for (unsigned i = 0; i < HCONT_SLOTS; i++) {
++				if (hcont[i].pid == pid) {
++					slot = i;
++				}
++			}
++			if (slot == HCONT_SLOTS) {
++				slot = hcont_next++ % HCONT_SLOTS;
++			}
++			hcont[slot].pid = pid;
++			strlcpy(hcont[slot].path, e + 5, sizeof(hcont[slot].path));
++			lck_spin_unlock(&hcont_spin);
++			static unsigned noted;
++			if (noted++ < 30) {
++				printf("NOTEFE CONTAINER: pid %d %s\n", pid, e + 5);
++			}
++			return;
++		}
++		e += l + 1;
++	}
++}
++
++int herolte_container_for_pid(int pid, char *out, size_t size);
++int
++herolte_container_for_pid(int pid, char *out, size_t size)
++{
++	int found = 0;
++	lck_spin_lock(&hcont_spin);
++	for (unsigned i = 0; i < HCONT_SLOTS && !found; i++) {
++		if (hcont[i].pid == pid && hcont[i].path[0]) {
++			strlcpy(out, hcont[i].path, size);
++			found = 1;
++		}
++	}
++	lck_spin_unlock(&hcont_spin);
++	return found;
++}
++
+ /*
+  * Note FE 0409: boot-arg herobot=1 makes sysctl kern.notefe_hid writable by root: "t FINGER DOWN X Y" (panel pixels,
+  * 1440x2560; DOWN 1 again is a move, 0 lifts) and "k KEY DOWN" (0 power, 1 volume up, 2 volume down, 3 home) go to the
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 62f690d..193a618 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5763,6 +5763,15 @@ exec_extract_strings(struct image_params *imgp)
+ 			printf("XPC[%d] %s\n", proc_getpid(vfs_context_proc(imgp->ip_vfs_context)),
+ 			    imgp->ip_startargv + strlen(imgp->ip_startargv) + 1);
+ 		}
++		/*
++		 * Note FE 0412: remember the process's container (HOME under /Containers/, set by RunningBoard for apps and
++		 * extensions) for the Sandbox stand-in's container-path query (bsd/kern/sweet_amfi.c, op 4).
++		 */
++		{
++			extern void herolte_note_container(int pid, const char *env, size_t len);
++			herolte_note_container(proc_getpid(vfs_context_proc(imgp->ip_vfs_context)), imgp->ip_endargv,
++			    (size_t)(imgp->ip_strendp - imgp->ip_endargv));
++		}
+ 		/* posix_spawn runs this on the parent's thread: the new process is the context's. */
+ 		int n = herolte_gl_env(imgp->ip_strings + strlen(EXECUTABLE_KEY),
+ 		    proc_getpid(vfs_context_proc(imgp->ip_vfs_context)), extra, 4);
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 1293a4f..3e8127e 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -346,6 +346,29 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	if (call == 7) {
+ 		return 0;
+ 	}
++	/* Note FE 0412: op 4 container path {pid, pidversion, char *buf, size, by token}: the HOME seen at exec. */
++	if (call == 4) {
++		struct {
++			uint64_t pid, pidversion, buf, size, by_token;
++		} a;
++		char path[208];
++		extern int herolte_container_for_pid(int pid, char *out, size_t size);
++		if (copyin(arg, &a, sizeof(a)) != 0 || a.buf == 0) {
++			return EFAULT;
++		}
++		if (!herolte_container_for_pid((int)a.pid, path, sizeof(path))) {
++			return ENOENT;
++		}
++		size_t len = strlen(path) + 1;
++		if (len > a.size) {
++			return ERANGE;
++		}
++		static unsigned answered;
++		if (answered++ < 20) {
++			printf("NOTEFE SANDBOX: container of pid %llu: %s\n", (unsigned long long)a.pid, path);
++		}
++		return copyout(path, (user_addr_t)a.buf, len);
++	}
+ #endif
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */

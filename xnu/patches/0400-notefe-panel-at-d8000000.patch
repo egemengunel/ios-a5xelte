@@ -1,0 +1,36 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: panel scanout buffer at 0xd8000000
+
+The Galaxy Note FE (SM-N935F) S-Boot scans out from 0xd8000000: its
+command line names s3cfb.bootloaderfb=0xd8000000, and the scan probe read
+the same value back from IDMA G1 (0x13952000) VG_BASE_ADDR_Y(0) at +0x74
+(photo, 2026-11-10). The S7 value 0xe2a00000 is not shown on this panel.
+Both the early console (A5XELTE_FB_PA) and the GPU panel buffer (HG_FB_PA,
+also the first flip target of patch 0322) follow.
+---
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 03ec822..a031e23 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -213,7 +213,7 @@ hg_pmic_dump(void)
+ #define HG_GREEN        0xff00ff00u
+ 
+ /* Panel scanout (mkadt_herolte.py FB_BASE) and the square to clear. */
+-#define HG_FB_PA        0xe2a00000ull
++#define HG_FB_PA        0xd8000000ull   /* Note FE: S-Boot scanout (was S7 0xe2a00000) */
+ #define HG_FB_STRIDE    5760u
+ #define HG_SQ_X         656u            /* (1440 - 128) / 2, 16-pixel aligned */
+ #define HG_SQ_Y         1216u           /* (2560 - 128) / 2 */
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index 8f9c8a2..6d5f60f 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -16,7 +16,7 @@
+ /* Logical 0..3: Cortex-A53 "Apollo" MPIDR 0x100..0x103 (boot cluster);
+  * 4..7: Mongoose MPIDR 0x0..0x3. All started with PSCI CPU_ON. */
+ #define SWEET_SMP_MAX_CPUS            8
+-#define A5XELTE_FB_PA                 0xe2a00000
++#define A5XELTE_FB_PA                 0xd8000000  /* Note FE (gracerlte): S-Boot scanout, IDMA G1 VG_BASE_ADDR_Y (scan probe 2) */
+ #define A5XELTE_FB_WIDTH              1440
+ #define A5XELTE_FB_HEIGHT             2560
+ #define A5XELTE_FB_STRIDE             5760

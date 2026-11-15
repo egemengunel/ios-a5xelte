@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 9eb218f..8e3a536 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2708,6 +2708,8 @@ static uint32_t nc_last_frm, nc_exp = 1020, nc_gain = 0x20, nc_reads, nc_torn;
+ static uint16_t *nc_copy;               /* 0457: the finished slot copied out at once (reading the uncached ring pixel by pixel
+                                          * took 0.3-0.45 s, and the ring wraps every ~133 ms) */
+ static uint64_t nc_seq, nc_user_exp_until;
++static uint32_t nc_sensor_id = 2;       /* 0463: the number the frames carry: whatever HAKIOS_CAMERA_SENSOR asked for (one camera
++                                         * here, so the back and the front streams both get its frames, as on the S9) */
+ static struct {
+ 	vm_offset_t top, csis, phy, pmu, mmu, cam1, pins;
+ 	uint8_t l5, l6, l7, l13;
+@@ -2935,7 +2937,7 @@ nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		                  .stride = NC_STRIDE, .format = 1, .bayer = 1, .black = 64, .sequence = nc_seq,
+ 		                  .time = mach_absolute_time(), .exposure_lines = nc_exp, .line_ns = 16340, .gain = nc_gain,
+ 		                  .gain_unity = 0x20, .gain_max = 0x200, .frame_lines = 2040, .frame_lines_min = 2040,
+-		                  .frame_lines_max = 2040, .margin = 4, .sensor = 2, .focus = 0xffffffffu,
++		                  .frame_lines_max = 2040, .margin = 4, .sensor = nc_sensor_id, .focus = 0xffffffffu,
+ 		                  .reserved = { slot, act, f, 0, 0 } };      /* 0457: the slot read, DMA0's active pointer, FRM_CNT */
+ 	memcpy(h.magic, "RWFRAME1", 8);
+ 	int error = uiomove((caddr_t)&h, (int)MIN(sizeof(h), (size_t)uio_resid(uio)), uio);
+@@ -2980,6 +2982,9 @@ nc_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		if (error) {
+ 			return error;
+ 		}
++		if (c.command == 3) {                          /* HAKIOS_CAMERA_SENSOR: taken, the frames carry it */
++			nc_sensor_id = c.a;
++		}
+ 		if (c.command == 1 && nc_streaming) {           /* HAKIOS_CAMERA_EXPOSURE */
+ 			nc_set_exposure(c.a, c.b);
+ 			clock_interval_to_deadline(2, NSEC_PER_SEC, &nc_user_exp_until);

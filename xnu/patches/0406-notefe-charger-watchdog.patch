@@ -1,0 +1,180 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: keep the MAX77854 charger's watchdog cleared (as Android) and report the charger's own state
+
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 8ce84d0..4b0364a 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -51,6 +51,7 @@ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
+ #define HSI2C_ADDR      0x70
+ 
+ static vm_offset_t fg_i2c, fg_pins;
++static uint8_t fg_slave = FG_ADDR;      /* Note FE 0406: 0x69 for the charger registers */
+ 
+ static uint32_t
+ fg_rd(vm_offset_t base, uint32_t off)
+@@ -97,7 +98,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 
+ 	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
+ 	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
+-	fg_wr(fg_i2c, HSI2C_ADDR, FG_ADDR << 10);
++	fg_wr(fg_i2c, HSI2C_ADDR, (uint32_t)fg_slave << 10);
+ 	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
+ 	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
+ 	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
+@@ -164,6 +165,101 @@ fg_word(uint8_t reg, uint16_t *value)
+ 	return false;
+ }
+ 
++/*
++ * Note FE 0406: the MAX77854's charger (Linux drivers/battery_v2/max77854_charger.c), registers 0xb0-0xc6 of its charger
++ * slave 0x69 (drivers/mfd/max77854.c I2C_ADDR_CHG 0xD2 >> 1; 0x66 is the top/PMIC slave, which reads 0xff there) on this same bus. Android's driver sets WDTEN (CHG_CNFG_00 bit 4) and clears the watchdog (CHG_CNFG_06
++ * WDTCLR, bit 0) at every health poll; TWRP showed CNFG_00 0x15 while charging. Nothing cleared it under iOS, so about
++ * 80 s after the hand-over the charger stopped ("not charging while iOS runs"). Read: DETAILS_00 0xb3 (CHGIN_DTLS
++ * bits 6:5, 3 = input valid), DETAILS_01 0xb4 (CHG_DTLS bits 3:0: 0-3 charging, 4 done; BAT_DTLS 6:4), CNFG_00 0xb7.
++ * Written: only WDTCLR, as Android does, while the hottest SoC sensor is under 50 C (the battery's thermistor is read
++ * by Android through an ADC we don't drive): above it, or if this kernel stops, the watchdog ends charging by itself.
++ * Boot-arg herochgwdt=0: read only.
++ */
++#define CHG_ADDR        0x69u
++#define CHG_DETAILS_00  0xb3
++#define CHG_DETAILS_01  0xb4
++#define CHG_DETAILS_02  0xb5
++#define CHG_CNFG_00     0xb7
++#define CHG_CNFG_02     0xb9
++#define CHG_CNFG_06     0xbd
++#define CHG_CNFG_09     0xc0
++#define CHG_WDTEN       0x10u
++#define CHG_WDTCLR      0x01u
++#define CHG_KICK_MAX_C  50
++
++static bool
++chg_byte(uint8_t reg, uint8_t *value)
++{
++	bool ok = false;
++	fg_slave = CHG_ADDR;
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		ok = fg_message(false, &reg, 1, false) && fg_message(true, value, 1, true);
++		if (!ok) {
++			delay(500);
++		}
++	}
++	fg_slave = FG_ADDR;
++	return ok;
++}
++
++static bool
++chg_write(uint8_t reg, uint8_t value)
++{
++	uint8_t b[2] = { reg, value };
++	fg_slave = CHG_ADDR;
++	bool ok = fg_message(false, b, 2, true);
++	fg_slave = FG_ADDR;
++	return ok;
++}
++
++int herolte_chg_poll(bool *external, bool *charging, bool *full);
++int
++herolte_chg_poll(bool *external, bool *charging, bool *full)
++{
++	static int kick = -1;
++	if (kick < 0) {
++		kick = 1;
++		PE_parse_boot_argn("herochgwdt", &kick, sizeof(kick));
++	}
++	uint8_t d0, d1, d2, c0, c2, c6, c9;
++	if (!fg_i2c || !chg_byte(CHG_DETAILS_00, &d0) || !chg_byte(CHG_DETAILS_01, &d1) ||
++	    !chg_byte(CHG_DETAILS_02, &d2) || !chg_byte(CHG_CNFG_00, &c0) || !chg_byte(CHG_CNFG_02, &c2) ||
++	    !chg_byte(CHG_CNFG_06, &c6) || !chg_byte(CHG_CNFG_09, &c9)) {
++		return -1;
++	}
++	if (d0 == 0xff && d1 == 0xff && c0 == 0xff && c6 == 0xff) {
++		static unsigned bad;
++		if (bad++ < 3) {
++			printf("NOTEFE CHG: charger registers all read 0xff: not the charger, nothing written\n");
++		}
++		return -1;              /* the caller falls back to the gauge's current */
++	}
++	extern volatile int herolte_soc_top_c;          /* herolte_gpu.c (0406) */
++	int soc = herolte_soc_top_c;
++	bool kicked = false;
++	static unsigned polls;
++	/* The TMUs are first read about a minute in: until then (the first five polls, 2.5 min) clear it anyway. */
++	bool cool = soc > -1000 ? soc < CHG_KICK_MAX_C : polls++ < 5;
++	if (kick && (c0 & CHG_WDTEN) && cool) {
++		kicked = chg_write(CHG_CNFG_06, (uint8_t)(c6 | CHG_WDTCLR));
++	}
++	unsigned dtls = d1 & 0x0fu;
++	*external = ((d0 >> 5) & 3u) == 3u;
++	*charging = *external && dtls <= 3u;
++	*full = *external && dtls == 4u;
++	static unsigned logged;
++	static uint8_t last_d1 = 0xff, last_c0 = 0xff;
++	if (logged++ % 10 == 0 || d1 != last_d1 || c0 != last_c0) {
++		printf("NOTEFE CHG: in=%u dtls=%#x bat=%u byp=%#x cnfg00=%#x cnfg02=%#x cnfg06=%#x cnfg09=%#x | %s%s (SoC %d C)\n",
++		    (d0 >> 5) & 3u, dtls, (d1 >> 4) & 7u, d2 & 0x0fu, c0, c2, c6, c9,
++		    !(c0 & CHG_WDTEN) ? "watchdog off" : kicked ? "watchdog cleared" : kick ? "watchdog NOT cleared" : "read only",
++		    *charging ? ", charging" : *full ? ", full" : *external ? ", cable, not charging" : ", no cable", soc);
++	}
++	last_d1 = d1;
++	last_c0 = c0;
++	return 0;
++}
++
+ int
+ herolte_fg_init(void)
+ {
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 6029607..93fee02 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2390,6 +2390,7 @@ hg_cpu_up(void)
+  */
+ volatile uint64_t herolte_screen_off_at;        /* mach time the display went off; 0 while it is on */
+ volatile int herolte_fg_temp_dc = -10000;       /* the battery, tenths of a degree; -10000 not read */
++volatile int herolte_soc_top_c = -1000;        /* Note FE 0406: hottest TMU, degrees; -1000 not read (herolte_battery.c) */
+ 
+ static const uint32_t hp_tmu_pa[] = { 0x10060000u, 0x10064000u, 0x10068000u, 0x1006c000u };   /* MNGS, APOLLO, GPU, ISP */
+ 
+@@ -2467,6 +2468,7 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 			}
+ 		}
+ 		seen_max = top > seen_max ? top : seen_max;
++		herolte_soc_top_c = top;
+ 		if (top > -1000) {
+ 			if (top >= (int)hot) {
+ 				hot_now = true;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d8a0fd..7109ec0 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,7 @@
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
+ extern "C" int herolte_fg_init(void);
++extern "C" int herolte_chg_poll(bool *external, bool *charging, bool *full);       /* Note FE 0406 */
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
+ #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
+@@ -230,14 +231,18 @@ SweetBattery::poll(void)
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+-	/* No charger driver: the gauge's charge current marks a cable. */
+-	bool charging = ma > 20;
++	/* No charger driver: the gauge's charge current marks a cable. Note FE 0406: the MAX77854 charger's own state. */
++	bool charging = ma > 20, external = charging, chgfull = false;
++	bool chgok = herolte_chg_poll(&external, &charging, &chgfull) == 0;
++	if (!chgok) {
++		external = charging = ma > 20;
++	}
+ 	static unsigned logged;
+ 	if (logged++ % 10 == 0) {
+ 		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh\n",
+ 		    percent, mv, ma, rem, full);
+ 	}
+-	publish(percent, mv, ma, charging, charging, charging, false, true, true);
++	publish(chgfull ? 100 : percent, mv, ma, external, external, charging, chgfull, true, true);
+ }
+ #else
+ void

@@ -1,0 +1,316 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 0fb97c6..9aa2edc 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2296,8 +2296,19 @@ static const struct { uint16_t reg, val; uint8_t bits; } nc_4e6_mode[] = {
+ /* 121 writes */
+ 
+ #define NC_BUF          0xd0800000u
+-#define NC_W            2608u
+-#define NC_H            1960u
++#define NC_FULL_W       2608u
++#define NC_FULL_H       1960u
++/* 0455: the frame's size by mode (0 full 2608x1960, 1 2x2 binned 1304x980, 2 centred 1280x720 crop), and the options
++ * that were boot-args (the line is nearly full): sysctl kern.notefe_cam_{tp,skip,pll,settle,mode} (root), set by the bot
++ * from the drop zone's cam.opts; a boot-arg of the same name (notefe_cam_tp ...) still wins. */
++extern vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);
++static uint32_t nc_w = NC_FULL_W, nc_h = NC_FULL_H;
++static uint32_t nc_o_tp, nc_o_skip, nc_o_pll = 166, nc_o_settle = 22, nc_o_mode;
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_tp, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_tp, 0, "Note FE camera: test pattern (0 off)");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_skip, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_skip, 0, "Note FE camera: 1 no AE, 2 no picture");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_pll, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_pll, 0, "Note FE camera: sensor PLL multiplier");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_settle, 0, "Note FE camera: CSIS settle");
++SYSCTL_UINT(_kern, OID_AUTO, notefe_cam_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &nc_o_mode, 0, "Note FE camera: 0 full, 1 binned, 2 720p crop");
+ 
+ static bool
+ nc_sensor_write(uint8_t a7, uint16_t reg, uint16_t val, int bits)
+@@ -2354,7 +2365,7 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+ 	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xff) << 24) | (3u << 1));
+ 	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (1u << 8));
+ 	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
+-	notefe_wr(csis, 0x44, (NC_H << 16) | NC_W);
++	notefe_wr(csis, 0x44, (nc_h << 16) | nc_w);
+ 	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
+ 	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
+ 		notefe_wr(csis, a, NC_BUF);
+@@ -2368,61 +2379,41 @@ nc_csis_setup(vm_offset_t csis, uint32_t settle)
+ }
+ 
+ /*
+- * Note FE (0450): the last frame, binned for the Mac: every other 2x2 Bayer cell of the 2608 x 1960 16-bit frame at
+- * 0xd0800000, so 1304 x 980 with the Bayer pattern kept, 8 bits (value >> 2). Read through one mapping (0451). sysctl kern.notefe_cam_pic (root) hands it out; the bot writes it to the drop zone.
++ * Note FE (0450, 0455): the last frame, binned for the Mac: every other 2x2 Bayer cell, so (w/2) x (h/2) with the Bayer
++ * pattern kept, 8 bits (value >> 2), after an 8-byte header (width, height). Read through the frame's one permanent
++ * mapping (notefe_physmap). sysctl kern.notefe_cam_pic (root) hands it out; the bot writes it to the drop zone.
+  */
+-#define NC_PW   (NC_W / 2)
+-#define NC_PH   (NC_H / 2)
+ static uint8_t *nc_pic;
++static uint32_t nc_pic_len;
++static vm_offset_t nc_frame;            /* NC_BUF, a whole full-size frame, mapped once */
+ 
+-/*
+- * 0453: no big mapping (0450's ml_io_unmap of io_submap pieces and 0451's 10 MB ml_io_map_unmappable both hung the
+- * boot). One permanent 1 MB window at 0xd1200000 stays mapped; while the sensor streams, DMA0's eight frame pointers
+- * are moved back a slice at a time (base = window - k x slice, a slice being whole rows) so that rows
+- * [k x slice, (k + 1) x slice) of the next frames land in the window, and those rows are binned into the picture.
+- * The frames' other rows go to the rest of the camera ION range (0xd0800000-0xd1c00000, below 0xd8000000).
+- */
+-#define NC_PWIN 0xd1200000u
+ static void
+-nc_make_picture(vm_offset_t csis)
++nc_make_picture(void)
+ {
+-	static vm_offset_t w;
+-	printf("NOTEFE CAM: picture: allocating %u bytes\n", NC_PW * NC_PH);
++	uint32_t pw = nc_w / 2, ph = nc_h / 2;
+ 	if (!nc_pic) {
+-		nc_pic = kalloc_data(NC_PW * NC_PH, Z_WAITOK);
+-	}
+-	if (!w) {
+-		w = ml_io_map(NC_PWIN, 0x100000);
++		nc_pic = kalloc_data(8 + (NC_FULL_W / 2) * (NC_FULL_H / 2), Z_WAITOK);
+ 	}
+-	if (!nc_pic || !w) {
+-		printf("NOTEFE CAM: picture: no buffer (%p) or window (%#lx)\n", nc_pic, (unsigned long)w);
++	if (!nc_pic || !nc_frame) {
++		printf("NOTEFE CAM: picture: no buffer\n");
+ 		return;
+ 	}
+-	const uint32_t row = NC_W * 2, rows_per = 0x100000 / row, slice = rows_per * row;
+-	unsigned slices = 0;
+-	for (uint32_t y0 = 0; y0 < NC_H; y0 += rows_per, slices++) {
+-		uint32_t base = NC_PWIN - (y0 / rows_per) * slice;
+-		for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
+-			notefe_wr(csis, a, base);
+-		}
+-		delay(140000);                          /* four frames at ~30 a second */
+-		uint32_t n = MIN(rows_per, NC_H - y0);
+-		for (uint32_t y = y0; y < y0 + n; y++) {
+-			if ((y & 3) >= 2) {
+-				continue;
+-			}
+-			volatile uint16_t *src = (volatile uint16_t *)(w + (y - y0) * row);
+-			uint8_t *dst = nc_pic + ((y >> 2) * 2 + (y & 1)) * NC_PW;
+-			for (uint32_t x = 0; x < NC_W; x += 4) {
+-				dst[x / 2] = (uint8_t)((src[x] & 0x3ff) >> 2);
+-				dst[x / 2 + 1] = (uint8_t)((src[x + 1] & 0x3ff) >> 2);
+-			}
++	((uint32_t *)nc_pic)[0] = pw;
++	((uint32_t *)nc_pic)[1] = ph;
++	const uint32_t row = nc_w * 2;
++	for (uint32_t y = 0; y < nc_h; y++) {
++		if ((y & 3) >= 2) {
++			continue;                       /* rows 0,1 of every 4: one 2x2 cell row in two */
++		}
++		volatile uint16_t *src = (volatile uint16_t *)(nc_frame + y * row);
++		uint8_t *dst = nc_pic + 8 + ((y >> 2) * 2 + (y & 1)) * pw;
++		for (uint32_t x = 0; x + 1 < nc_w; x += 4) {
++			dst[x / 2] = (uint8_t)((src[x] & 0x3ff) >> 2);
++			dst[x / 2 + 1] = (uint8_t)((src[x + 1] & 0x3ff) >> 2);
+ 		}
+ 	}
+-	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
+-		notefe_wr(csis, a, NC_BUF);
+-	}
+-	printf("NOTEFE CAM: picture: %u x %u Bayer, 8 bits, from %u slices: ready (kern.notefe_cam_pic)\n", NC_PW, NC_PH, slices);
++	nc_pic_len = 8 + pw * ph;
++	printf("NOTEFE CAM: picture: %u x %u Bayer, 8 bits: ready (kern.notefe_cam_pic)\n", pw, ph);
+ }
+ 
+ static int
+@@ -2432,20 +2423,19 @@ notefe_cam_pic_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (!nc_pic) {
++	if (!nc_pic || !nc_pic_len) {
+ 		return ENOENT;
+ 	}
+-	return SYSCTL_OUT(req, nc_pic, NC_PW * NC_PH);
++	return SYSCTL_OUT(req, nc_pic, nc_pic_len);
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_cam_pic_sysctl, "S", "Note FE: the front camera's last frame, 1304x980 Bayer 8-bit");
++    NULL, 0, notefe_cam_pic_sysctl, "S", "Note FE: the front camera's last frame, binned Bayer 8-bit, 8-byte header");
+ 
+ static void
+ notefe_cam_frame(vm_offset_t pins)
+ {
+-	static vm_offset_t top, csis, phy, pmu, mmu, win[3], cam1;
+-	static const uint32_t win_off[3] = { 0, 0x600000, 0x980000 };
++	static vm_offset_t top, csis, phy, pmu, mmu, cam1;
+ 	if (!top) {
+ 		top = ml_io_map(0x10570000u, 0x1000);
+ 		csis = ml_io_map(0x14100000u, 0x2000);
+@@ -2453,20 +2443,21 @@ notefe_cam_frame(vm_offset_t pins)
+ 		pmu = ml_io_map(0x105c0000u, 0x1000);
+ 		mmu = ml_io_map(0x141e0000u, 0x1000);
+ 		cam1 = ml_io_map(0x145d0000u, 0x1000);
+-		for (unsigned i = 0; i < 3; i++) {
+-			win[i] = ml_io_map(NC_BUF + win_off[i], 0x40000);
+-		}
++		nc_frame = notefe_physmap(NC_BUF, NC_FULL_W * NC_FULL_H * 2);
+ 	}
+-	if (!top || !csis || !phy || !pmu || !mmu || !cam1 || !win[0] || !win[1] || !win[2]) {
++	if (!top || !csis || !phy || !pmu || !mmu || !cam1 || !nc_frame) {
+ 		printf("NOTEFE CAM: frame: map failed\n");
+ 		return;
+ 	}
+ 	nc_pins = pins;
+ 	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
+-	for (unsigned i = 0; i < 3; i++) {
+-		for (uint32_t o = 0; o < 0x40000; o += 4) {
+-			*(volatile uint32_t *)(win[i] + o) = 0xa5a5a5a5u;
+-		}
++	uint32_t mode = nc_o_mode;
++	PE_parse_boot_argn("notefe_cam_mode", &mode, sizeof(mode));
++	nc_w = mode == 1 ? 1304 : mode == 2 ? 1280 : NC_FULL_W;
++	nc_h = mode == 1 ? 980 : mode == 2 ? 720 : NC_FULL_H;
++	const uint32_t fbytes = nc_w * nc_h * 2;
++	for (uint32_t o = 0; o < NC_FULL_W * NC_FULL_H * 2; o += 4) {
++		*(volatile uint32_t *)(nc_frame + o) = 0xa5a5a5a5u;
+ 	}
+ 	/* power, as stage 3 */
+ 	uint8_t l5 = 0, l6 = 0, l7 = 0, l13 = 0;
+@@ -2503,13 +2494,27 @@ notefe_cam_frame(vm_offset_t pins)
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	/* 0446: the table's PLL (0x0306 = 180, /6 at 0x0304) assumes a 24 MHz MCLK; ours is 26 MHz (OSCCLK only): 166 keeps
+ 	 * the lane rate (26 / 6 x 166 = 719 MHz, 24 / 6 x 180 = 720). cam-5 at 180: ECC, ID, lost FS/FE errors. */
+-	uint32_t pll = 166, settle = 22;
++	uint32_t pll = nc_o_pll, settle = nc_o_settle;
+ 	PE_parse_boot_argn("notefe_cam_pll", &pll, sizeof(pll));
+ 	PE_parse_boot_argn("notefe_cam_settle", &settle, sizeof(settle));
+ 	for (unsigned i = 0; i < sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0]); i++) {
+ 		uint16_t v = nc_4e6_mode[i].reg == 0x0306 ? (uint16_t)pll : nc_4e6_mode[i].val;
+ 		bad += !nc_sensor_write(0x35, nc_4e6_mode[i].reg, v, nc_4e6_mode[i].bits);
+ 	}
++	if (mode == 1) {        /* SMIA 2x2 binning (0x0900 enable, 0x0901 type 0x22), output 1304 x 980 */
++		bad += !nc_sensor_write(0x35, 0x0900, 0x01, 8);
++		bad += !nc_sensor_write(0x35, 0x0901, 0x22, 8);
++		bad += !nc_sensor_write(0x35, 0x034c, 1304, 16);
++		bad += !nc_sensor_write(0x35, 0x034e, 980, 16);
++	} else if (mode == 2) { /* SMIA crop: x 664-1943, y 620-1339, output 1280 x 720 */
++		bad += !nc_sensor_write(0x35, 0x0344, 664, 16);
++		bad += !nc_sensor_write(0x35, 0x0346, 620, 16);
++		bad += !nc_sensor_write(0x35, 0x0348, 1943, 16);
++		bad += !nc_sensor_write(0x35, 0x034a, 1339, 16);
++		bad += !nc_sensor_write(0x35, 0x034c, 1280, 16);
++		bad += !nc_sensor_write(0x35, 0x034e, 720, 16);
++	}
++	printf("NOTEFE CAM: frame: mode %u (%u x %u, %u bytes a frame)\n", mode, nc_w, nc_h, fbytes);
+ 	printf("NOTEFE CAM: frame: settle %u; sensor mode written (%u writes, %u not acknowledged); read back: output %u x %u, "
+ 	    "line %u, frame %u lines, PLL %u/%u\n", settle, (unsigned)(sizeof(nc_4e6_mode) / sizeof(nc_4e6_mode[0])), bad, nc_sensor_rd16(0x034c),
+ 	    nc_sensor_rd16(0x034e), nc_sensor_rd16(0x0342), nc_sensor_rd16(0x0340), nc_sensor_rd16(0x0306), nc_sensor_rd16(0x0304));
+@@ -2538,7 +2543,7 @@ notefe_cam_frame(vm_offset_t pins)
+ 	    notefe_rd(pmu, 0x714), notefe_rd(mmu, 0), mmu_ctrl);
+ 	/* 0454: notefe_cam_tp=N: the sensor's test pattern (SMIA 0x0600: 1 solid colour, 2 colour bars, 3 fade, 4 PN9),
+ 	 * a check of layout, row order and Bayer order with no light needed; AE is skipped then */
+-	uint32_t tp = 0;
++	uint32_t tp = nc_o_tp;
+ 	PE_parse_boot_argn("notefe_cam_tp", &tp, sizeof(tp));
+ 	if (tp) {
+ 		nc_sensor_write(0x35, 0x0600, (uint16_t)tp, 16);
+@@ -2571,10 +2576,8 @@ notefe_cam_frame(vm_offset_t pins)
+ 		settle = best;
+ 		nc_sensor_write(0x35, 0x0100, 0, 8);
+ 		delay(60000);
+-		for (unsigned i = 0; i < 3; i++) {
+-			for (uint32_t o = 0; o < 0x40000; o += 4) {
+-				*(volatile uint32_t *)(win[i] + o) = 0xa5a5a5a5u;
+-			}
++		for (uint32_t o = 0; o < fbytes; o += 4) {
++			*(volatile uint32_t *)(nc_frame + o) = 0xa5a5a5a5u;
+ 		}
+ 		nc_csis_setup(csis, settle);
+ 		nc_sensor_write(0x35, 0x0100, 1, 8);
+@@ -2588,7 +2591,7 @@ notefe_cam_frame(vm_offset_t pins)
+ 	/* 0450: a crude auto-exposure on the +6 MB window (the frame's middle rows; the DMA rewrites the same buffer every
+ 	 * frame): the mean above black (64) aimed at 18 % of 959; exposure 0x0202 (lines, up to frame - 4 = 2036) first,
+ 	 * then analogue gain 0x0204 (0x20 = 1x .. 0x200 = 16x), under the grouped hold 0x0104. Six steps, 200 ms each. */
+-	uint32_t exp_l = 0x3fc, gain = 0x20, skip = 0;
++	uint32_t exp_l = 0x3fc, gain = 0x20, skip = nc_o_skip;
+ 	PE_parse_boot_argn("notefe_cam_skip", &skip, sizeof(skip));        /* 0452: 1 no AE, 2 no picture (bisecting) */
+ 	if (tp) {
+ 		skip |= 1;
+@@ -2596,7 +2599,7 @@ notefe_cam_frame(vm_offset_t pins)
+ 	printf("NOTEFE CAM: frame: AE %s, picture %s\n", skip & 1 ? "skipped" : "on", skip & 2 ? "skipped" : "on");
+ 	for (unsigned step = 0; step < ((skip & 1) ? 0u : 6u); step++) {
+ 		uint64_t sum = 0;
+-		volatile uint16_t *px = (volatile uint16_t *)win[1];
++		volatile uint16_t *px = (volatile uint16_t *)(nc_frame + (nc_h / 2) * nc_w * 2);
+ 		for (uint32_t i = 0; i < 0x20000; i += 8) {
+ 			sum += px[i] & 0x3ff;
+ 		}
+@@ -2616,11 +2619,11 @@ notefe_cam_frame(vm_offset_t pins)
+ 		nc_sensor_write(0x35, 0x0104, 0, 8);
+ 		delay(200000);
+ 	}
+-	if (!(skip & 2)) {
+-		nc_make_picture(csis);
+-	}
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	delay(50000);
++	if (!(skip & 2)) {
++		nc_make_picture();
++	}
+ 	if (tp) {
+ 		nc_sensor_write(0x35, 0x0600, 0, 16);
+ 	}
+@@ -2638,17 +2641,17 @@ notefe_cam_frame(vm_offset_t pins)
+ 	notefe_wr(phy, 0x50, phyc);
+ 	notefe_wr(pmu, 0x714, iso);
+ 	notefe_wr(mmu, 0, mmu_ctrl);
+-	for (unsigned i = 0; i < 3; i++) {
++	{
+ 		uint32_t changed = 0, last = 0;
+-		for (uint32_t o = 0; o < 0x40000; o += 4) {
+-			if (*(volatile uint32_t *)(win[i] + o) != 0xa5a5a5a5u) {
++		for (uint32_t o = 0; o < NC_FULL_W * NC_FULL_H * 2; o += 4) {
++			if (*(volatile uint32_t *)(nc_frame + o) != 0xa5a5a5a5u) {
+ 				changed++;
+ 				last = o;
+ 			}
+ 		}
+-		volatile uint32_t *w = (volatile uint32_t *)win[i];
+-		printf("NOTEFE CAM: frame: buffer +%#x: %u of 65536 words changed%s, the last at +%#x; first %08x %08x %08x %08x\n",
+-		    win_off[i], changed, changed ? " (THE DMA WROTE)" : "", win_off[i] + last, w[0], w[1], w[2], w[3]);
++		volatile uint32_t *w = (volatile uint32_t *)nc_frame;
++		printf("NOTEFE CAM: frame: buffer: %u words changed (a frame is %u), the last at +%#x (a frame ends at +%#x); "
++		    "first %08x %08x %08x %08x\n", changed, fbytes / 4, last, fbytes - 4, w[0], w[1], w[2], w[3]);
+ 	}
+ power_down:
+ 	nc_pin(pins, 0x180, 2, 0, -1, -1);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 08609c3..8415ee0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1560,3 +1560,27 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	return ret;
+ }
+ #endif /* SWEET || A5XELTE */
++
++/*
++ * Note FE (0455): physical memory outside XNU's RAM (the camera ION range) mapped into the kernel for good, through an
++ * IOMemoryDescriptor, write-combined (normal memory, not cached: what a device's DMA writes is what the processor reads).
++ * The S9 ports' hakios.physmap does the same; ml_io_map's io_submap is only 8 MB, and freeing its pieces hung the boot
++ * (0450). The descriptor and the map are never released. 0 if it cannot be mapped.
++ */
++#include <IOKit/IOMemoryDescriptor.h>
++extern "C" vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);
++extern "C" vm_offset_t
++notefe_physmap(uint64_t pa, uint64_t len)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa, (IOByteCount)len,
++	    kIODirectionInOut);
++	if (!md) {
++		return 0;
++	}
++	IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++	if (!map) {
++		md->release();
++		return 0;
++	}
++	return (vm_offset_t)map->getVirtualAddress();
++}

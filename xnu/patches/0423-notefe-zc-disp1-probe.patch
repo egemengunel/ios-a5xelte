@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 5aed2da..58d3baf 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1889,6 +1889,23 @@ hfb_setup_locked(void)
+ 			    hg_rd(decon, b + 4), hg_rd(decon, b + 8), hg_rd(decon, b + 12), hg_rd(decon, b + 16),
+ 			    hg_rd(decon, b + 20), hg_rd(decon, b + 24), hg_rd(decon, b + 28));
+ 		}
++		/* 0423: only VGR0/VGR1 (DISP1, VPP ids 6/7) can scale on the 8890 (vpp.h is_vgr). DISP1's power domain
++		 * (PMU 0x105c41a0, parent DISP0 0x105c4080; STATUS = +4, 0xf = on) is read first: the PMU is always on.
++		 * VGR0 (0x13e03000, clock 900) is only read if DISP1 says it is on. */
++		{
++			vm_offset_t pmu = ml_io_map(0x105c4000u, 0x1000);
++			uint32_t d0c = pmu ? hg_rd(pmu, 0x80) : 0, d0s = pmu ? hg_rd(pmu, 0x84) : 0;
++			uint32_t d1c = pmu ? hg_rd(pmu, 0x1a0) : 0, d1s = pmu ? hg_rd(pmu, 0x1a4) : 0;
++			printf("NOTEFE ZC: power DISP0 config %#x status %#x, DISP1 config %#x status %#x\n", d0c, d0s, d1c, d1s);
++			if ((d1s & 0xf) == 0xf) {
++				vm_offset_t vgr0 = ml_io_map(0x13e03000u, 0x1000);
++				for (unsigned o = 0; vgr0 && o < 0x80; o += 0x20) {
++					printf("NOTEFE ZC: VGR0 +%#04x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(vgr0, o),
++					    hg_rd(vgr0, o + 4), hg_rd(vgr0, o + 8), hg_rd(vgr0, o + 12), hg_rd(vgr0, o + 16),
++					    hg_rd(vgr0, o + 20), hg_rd(vgr0, o + 24), hg_rd(vgr0, o + 28));
++				}
++			}
++		}
+ 		for (unsigned o = 0; decon && o < 0x130; o += 0x20) {
+ 			printf("NOTEFE ZC: DECON +%#05x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(decon, o), hg_rd(decon, o + 4),
+ 			    hg_rd(decon, o + 8), hg_rd(decon, o + 12), hg_rd(decon, o + 16), hg_rd(decon, o + 20),

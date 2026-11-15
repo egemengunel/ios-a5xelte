@@ -1,0 +1,39 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: log the Apollo (A53) cluster clock and voltage, read only
+
+Nothing in the port sets the Cortex-A53 cluster clock: it stays where S-Boot
+left it (the Mongoose cluster was left at 728 MHz). Log APOLLO_PLL, its muxes
+and dividers and vdd_apollo once, next to the Mongoose numbers, to decide
+whether raising it is worth a patch. No register is written.
+---
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index a031e23..96eb132 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2337,6 +2337,26 @@ hg_cpu_up(void)
+ 		return;     /* the APM is not up yet: the next call */
+ 	}
+ 	done = true;
++	/*
++	 * Note FE 0401, read only: the Apollo (Cortex-A53) cluster as S-Boot left it. Nothing in this port sets its
++	 * clock. CMU_APOLLO 0x11900000 (S5E8890-sfrbase.h): APOLLO_PLL_CON0 +0x100, muxes +0x200/+0x208, their status
++	 * +0x600/+0x608, dividers +0x400..+0x420; vdd_apollo is S2MPS16 BUCK3 (0x1e control, 0x1f output).
++	 */
++	{
++		vm_offset_t apollo = ml_io_map(0x11900000u, 0x1000);
++		if (apollo) {
++			uint32_t ac = hg_rd(apollo, 0x100);
++			uint32_t am = (ac >> 16) & 0x3ff, ap = (ac >> 8) & 0x3f, as = ac & 7;
++			uint8_t b3c = 0, b3o = 0;
++			bool vr = herolte_apm_pmic_read(0x1e, &b3c) && herolte_apm_pmic_read(0x1f, &b3o);
++			printf("NOTEFE CPU: APOLLO_PLL con0 %#x: M %u P %u S %u = %u MHz, mux %#x %#x stat %#x %#x\n", ac, am, ap, as,
++			    ap ? (26u * am) / (ap << as) : 0, hg_rd(apollo, 0x200), hg_rd(apollo, 0x208), hg_rd(apollo, 0x600), hg_rd(apollo, 0x608));
++			for (uint32_t off = 0x400; off <= 0x420; off += 4) {
++				printf("NOTEFE CPU: apollo div %#x = %#x\n", off, hg_rd(apollo, off));
++			}
++			printf("NOTEFE CPU: vdd_apollo BUCK3 ctrl %#x out %#x (%s; mV = 300 + 6.25 * out)\n", b3c, b3o, vr ? "read" : "not read");
++		}
++	}
+ 	/* the bootloader's numbers, for hc_go_low() */
+ 	hc.top = top;
+ 	hc.mngs = mngs;

@@ -1,0 +1,77 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 85d3118..c6577af 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1205,11 +1205,37 @@ nbt_command(const uint8_t *p, size_t len)
+ }
+ 
+ /* one event from the chip, fixed where iOS expects an Apple chip, then to iOS */
++static uint32_t nbt_ev[256], nbt_le[32];     /* events from the chip by code, LE meta (0x3e) by subevent */
++static uint16_t nbt_fake_op[32];            /* commands the chip refused (status 1), answered as success */
++static uint32_t nbt_fake_n[32];
++static unsigned nbt_scan_logged;
++
++static void
++nbt_count_fake(uint16_t op)
++{
++	for (int i = 0; i < 32; i++) {
++		if (nbt_fake_op[i] == op || nbt_fake_n[i] == 0) {
++			nbt_fake_op[i] = op;
++			nbt_fake_n[i]++;
++			return;
++		}
++	}
++}
++
+ static void
+ nbt_event(uint8_t *p, size_t len)
+ {
++	nbt_ev[p[1]]++;
++	if (p[1] == 0x3e && len >= 4 && p[3] < 32) {
++		nbt_le[p[3]]++;
++	}
+ 	if (p[1] == 0x0e && len >= 7) {
+ 		uint16_t op = (uint16_t)(p[4] | p[5] << 8);
++		/* LE scan parameters/enable (legacy and extended): what the chip says */
++		if ((op == 0x200b || op == 0x200c || op == 0x2041 || op == 0x2042) && nbt_scan_logged < 40) {
++			nbt_scan_logged++;
++			printf("NOTEFE BT: LE scan command %#06x: chip status %#04x\n", op, p[6]);
++		}
+ 		if (op == 0x1001 && len >= 15 && p[6] == 0) {
+ 			p[7] = 9;
+ 			p[10] = 9;
+@@ -1228,6 +1254,7 @@ nbt_event(uint8_t *p, size_t len)
+ 				printf("NOTEFE BT: chip: unknown command %#06x -> success for iOS\n", op);
+ 			}
+ 			nbt_fixed++;
++			nbt_count_fake(op);
+ 			nbt_complete(op, params, sizeof(params));
+ 			return;
+ 		}
+@@ -1325,6 +1352,26 @@ nbt_thread(__unused void *arg, __unused wait_result_t wr)
+ 			last_report = mach_absolute_time();
+ 			printf("NOTEFE BT: bridge: %llu bytes to the chip, %llu to iOS, %llu answered here, %llu fixed, "
+ 			    "%llu lost, %llu resyncs\n", nbt_to_chip, nbt_to_ios, nbt_local, nbt_fixed, nbt_lost, nbt_resync);
++			char line[256];
++			int o = 0;
++			line[0] = 0;
++			for (int e = 0; e < 256 && o < (int)sizeof(line) - 16; e++) {
++				if (nbt_ev[e] && e != 0x3e) {
++					o += snprintf(line + o, sizeof(line) - (size_t)o, " %02x:%u", e, nbt_ev[e]);
++				}
++			}
++			for (int e = 0; e < 32 && o < (int)sizeof(line) - 16; e++) {
++				if (nbt_le[e]) {
++					o += snprintf(line + o, sizeof(line) - (size_t)o, " le%02x:%u", e, nbt_le[e]);
++				}
++			}
++			printf("NOTEFE BT: events from the chip (code:count, leNN = LE subevent):%s\n", line);
++			o = 0;
++			line[0] = 0;
++			for (int i = 0; i < 32 && nbt_fake_n[i] && o < (int)sizeof(line) - 16; i++) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %04x:%u", nbt_fake_op[i], nbt_fake_n[i]);
++			}
++			printf("NOTEFE BT: refused by the chip, success for iOS (opcode:count):%s\n", line);
+ 		}
+ 		if (!busy) {
+ 			assert_wait_timeout((event_t)&nbt_txq_len, THREAD_UNINT, 1000, NSEC_PER_USEC);

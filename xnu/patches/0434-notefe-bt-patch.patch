@@ -1,0 +1,166 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 5afd55d..ffb54a1 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -24,6 +24,7 @@
+ #include <sys/kauth.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+@@ -628,6 +629,8 @@ notefe_hci(vm_offset_t uart, uint16_t opcode, uint8_t *ev, unsigned max)
+ 	return n;
+ }
+ 
++static void notefe_bt_patch(vm_offset_t uart);
++
+ static void
+ notefe_bt_up(int level, vm_offset_t top, vm_offset_t pins, vm_offset_t pins_i, vm_offset_t uart)
+ {
+@@ -702,8 +705,126 @@ notefe_bt_up(int level, vm_offset_t top, vm_offset_t pins, vm_offset_t pins_i, v
+ 		name[k] = 0;
+ 		printf("NOTEFE BT: local name \"%s\"\n", name);
+ 	}
++	if (level >= 7) {
++		notefe_bt_patch(uart);
++	}
++}
++
++/*
++ * Note FE (0434): Bluetooth step 4, the chip's patch. The bot writes the phone's own bcm4359C0_murata.hcd (VENDOR
++ * firmware/, put in the drop zone) to kern.notefe_bt_fw; kern.notefe_bt=7 then does steps 3-5 and sends it as Linux's
++ * btbcm.c does: Download Minidriver (0xfc2e), 50 ms, every record of the file (u16 opcode, u8 length, data) as one HCI
++ * command answered before the next (the last is Launch_RAM, 0xfc4e), 250 ms, HCI_Reset, Read Local Version / Name
++ * again: the LMP subversion and name are then the patch's. Still 115200 (about 6 s for 59 KB).
++ */
++static uint8_t *notefe_bt_fw_buf;
++static uint32_t notefe_bt_fw_len;
++
++static void
++notefe_bt_patch(vm_offset_t uart)
++{
++	uint8_t ev[260];
++	if (!notefe_bt_fw_buf || notefe_bt_fw_len < 3) {
++		printf("NOTEFE BT: no patch loaded (kern.notefe_bt_fw)\n");
++		return;
++	}
++	/* check the file first: records must end exactly at its end */
++	uint32_t at = 0, records = 0;
++	while (at + 3 <= notefe_bt_fw_len) {
++		at += 3 + notefe_bt_fw_buf[at + 2];
++		records++;
++	}
++	if (at != notefe_bt_fw_len) {
++		printf("NOTEFE BT: patch malformed (%u records, ends at %u of %u)\n", records, at, notefe_bt_fw_len);
++		return;
++	}
++	if (notefe_hci(uart, 0xfc2e, ev, sizeof(ev)) < 7 || ev[6] != 0) {
++		printf("NOTEFE BT: Download Minidriver refused\n");
++		return;
++	}
++	delay(50000);
++	uint32_t sent = 0, bad = 0;
++	for (at = 0; at + 3 <= notefe_bt_fw_len; ) {
++		uint16_t op = (uint16_t)(notefe_bt_fw_buf[at] | notefe_bt_fw_buf[at + 1] << 8);
++		uint8_t len = notefe_bt_fw_buf[at + 2];
++		uint8_t hdr = 0x01;
++		if (!notefe_uart_write(uart, &hdr, 1) || !notefe_uart_write(uart, notefe_bt_fw_buf + at, 3u + len)) {
++			printf("NOTEFE BT: patch TX stuck at record %u\n", sent);
++			return;
++		}
++		unsigned n = notefe_uart_read(uart, ev, 3, 2000000, 3);
++		if (n == 3 && ev[0] == 0x04) {
++			n += notefe_uart_read(uart, ev + 3, ev[2], 500000, ev[2]);
++		}
++		if (n < 7 || ev[1] != 0x0e || (ev[4] | ev[5] << 8) != op || ev[6] != 0) {
++			if (bad++ < 3) {
++				char what[48];
++				snprintf(what, sizeof(what), "patch record %u op %#06x ->", sent, op);
++				notefe_hex(what, ev, n);
++			}
++			if (n == 0) {
++				printf("NOTEFE BT: no answer, stopping the patch at record %u of %u\n", sent, records);
++				return;
++			}
++		}
++		at += 3u + len;
++		sent++;
++	}
++	printf("NOTEFE BT: patch sent: %u of %u records, %u odd answers\n", sent, records, bad);
++	delay(250000);
++	notefe_hci(uart, 0x0c03, ev, sizeof(ev));
++	unsigned n = notefe_hci(uart, 0x1001, ev, sizeof(ev));
++	if (n >= 15 && ev[1] == 0x0e) {
++		printf("NOTEFE BT: after patch: hci %u rev %#x lmp %u manufacturer %#x lmp_sub %#x\n", ev[7],
++		    ev[8] | ev[9] << 8, ev[10], ev[11] | ev[12] << 8, ev[13] | ev[14] << 8);
++	}
++	n = notefe_hci(uart, 0x0c14, ev, sizeof(ev));
++	if (n > 7 && ev[1] == 0x0e) {
++		char name[64];
++		unsigned k = 0;
++		for (unsigned i = 7; i < n && k < sizeof(name) - 1 && ev[i]; i++) {
++			name[k++] = (ev[i] >= 32 && ev[i] < 127) ? (char)ev[i] : '?';
++		}
++		name[k] = 0;
++		printf("NOTEFE BT: after patch: local name \"%s\"\n", name);
++	}
+ }
+ 
++static int
++notefe_bt_fw_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr == USER_ADDR_NULL) {
++		int len = (int)notefe_bt_fw_len;
++		return SYSCTL_OUT(req, &len, sizeof(len));
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newlen < 3 || req->newlen > 256 * 1024) {
++		return EINVAL;
++	}
++	uint8_t *buf = kalloc_data(req->newlen, Z_WAITOK);
++	if (!buf) {
++		return ENOMEM;
++	}
++	int error = SYSCTL_IN(req, buf, req->newlen);
++	if (error) {
++		kfree_data(buf, req->newlen);
++		return error;
++	}
++	if (notefe_bt_fw_buf) {
++		kfree_data(notefe_bt_fw_buf, notefe_bt_fw_len);
++	}
++	notefe_bt_fw_buf = buf;
++	notefe_bt_fw_len = (uint32_t)req->newlen;
++	printf("NOTEFE BT: patch file loaded, %u bytes\n", notefe_bt_fw_len);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, notefe_bt_fw, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, notefe_bt_fw_sysctl, "S", "Note FE: the Bluetooth chip's .hcd patch (root writes it)");
++
+ static void
+ notefe_bt_probe(int level)
+ {
+@@ -758,7 +879,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 6) {
++	if (value < 1 || value > 7) {
+ 		return EINVAL;
+ 	}
+ 	notefe_bt_last = value;
+@@ -767,7 +888,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth (1-2 read only, 3 UART loopback, 4 chip power, 5 HCI version, 6 chip off)");
++    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth (1-2 read only, 3 UART loopback, 4 chip power, 5 HCI version, 6 chip off, 7 + patch)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

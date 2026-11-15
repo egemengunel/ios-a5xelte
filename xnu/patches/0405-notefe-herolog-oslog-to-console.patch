@@ -1,0 +1,99 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: boot-arg herolog (default tccd,assetsd): os_log of the named programs into the console log
+
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 8e78c52..6378ac0 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -122,8 +122,74 @@ herolte_noexec(const char *path)
+ 	return false;
+ }
+ 
++static int herolte_gl_env_base(const char *path, int pid, const char **extra, int max);
++
++/*
++ * Note FE 0405: boot-arg herolog=name,name (default tccd,assetsd; - for none). The named programs (matched on the file
++ * name, and on the 15-character process name for the /dev/null tee in bsd/dev/mem.c) start with OS_ACTIVITY_DT_MODE=YES:
++ * libtrace then also writes their os_log lines to stderr, which launchd points at /dev/null, and the tee puts them in
++ * this log as "|name| ...". It is how we read what tccd answers and why (iOS keeps its unified log on the phone only).
++ */
++static char hlog_names[192];
++static int hlog_read;
++
++static bool
++herolte_name_in(const char *list, const char *name, size_t n)
++{
++	for (const char *t = list; *t != '\0';) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl > 0 && n > 0 && (tl == n || (n >= 15 && tl > n)) && strncmp(t, name, n) == 0) {
++			return true;        /* p_comm keeps 16 characters: CalendarWidgetEx... */
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++bool herolte_log_name(const char *name);
++bool
++herolte_log_name(const char *name)
++{
++	if (!hlog_read) {
++		hlog_read = 1;
++		if (!PE_parse_boot_argn("herolog", hlog_names, sizeof(hlog_names))) {
++			strlcpy(hlog_names, "tccd,assetsd", sizeof(hlog_names));
++		}
++		if (hlog_names[0] == '-') {
++			hlog_names[0] = '\0';
++		}
++		if (hlog_names[0] != '\0') {
++			printf("NOTEFE LOG: os_log of %s goes to this log (herolog)\n", hlog_names);
++		}
++	}
++	return name != NULL && herolte_name_in(hlog_names, name, strlen(name));
++}
++
+ int
+ herolte_gl_env(const char *path, int pid, const char **extra, int max)
++{
++	int n = herolte_gl_env_base(path, pid, extra, max);
++	if (n < 0 || path == NULL || n >= max) {
++		return n;
++	}
++	const char *base = strrchr(path, '/');
++	base = base ? base + 1 : path;
++	if (herolte_log_name(base)) {
++		extra[n++] = "OS_ACTIVITY_DT_MODE=YES";
++		static unsigned announced;
++		if (announced++ < 40) {
++			printf("NOTEFE LOG: %s (pid %d) logs to the console\n", base, pid);
++		}
++	}
++	return n;
++}
++
++static int
++herolte_gl_env_base(const char *path, int pid, const char **extra, int max)
+ {
+ 	if (herolte_noexec(path)) {
+ 		static unsigned refused;
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 291a546..e065cc5 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -176,6 +176,12 @@ sweet_null_tee(char *name, size_t len)
+ 	}
+ 	proc_selfname(name, (int)len);
+ 	size_t n = strlen(name);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	extern bool herolte_log_name(const char *name);         /* Note FE 0405: boot-arg herolog */
++	if (herolte_log_name(name)) {
++		return true;
++	}
++#endif
+ 	for (const char *t = sweet_null_names; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);

@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 46cabe9..09bd50b 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2378,9 +2378,11 @@ static uint8_t *nc_pic;
+ static void
+ nc_make_picture(void)
+ {
++	printf("NOTEFE CAM: picture: allocating %u bytes\n", NC_PW * NC_PH);
+ 	if (!nc_pic) {
+ 		nc_pic = kalloc_data(NC_PW * NC_PH, Z_WAITOK);
+ 	}
++	printf("NOTEFE CAM: picture: buffer %p; mapping the frame\n", nc_pic);
+ 	if (!nc_pic) {
+ 		return;
+ 	}
+@@ -2562,8 +2564,10 @@ notefe_cam_frame(vm_offset_t pins)
+ 	/* 0450: a crude auto-exposure on the +6 MB window (the frame's middle rows; the DMA rewrites the same buffer every
+ 	 * frame): the mean above black (64) aimed at 18 % of 959; exposure 0x0202 (lines, up to frame - 4 = 2036) first,
+ 	 * then analogue gain 0x0204 (0x20 = 1x .. 0x200 = 16x), under the grouped hold 0x0104. Six steps, 200 ms each. */
+-	uint32_t exp_l = 0x3fc, gain = 0x20;
+-	for (unsigned step = 0; step < 6; step++) {
++	uint32_t exp_l = 0x3fc, gain = 0x20, skip = 0;
++	PE_parse_boot_argn("notefe_cam_skip", &skip, sizeof(skip));        /* 0452: 1 no AE, 2 no picture (bisecting) */
++	printf("NOTEFE CAM: frame: AE %s, picture %s\n", skip & 1 ? "skipped" : "on", skip & 2 ? "skipped" : "on");
++	for (unsigned step = 0; step < ((skip & 1) ? 0u : 6u); step++) {
+ 		uint64_t sum = 0;
+ 		volatile uint16_t *px = (volatile uint16_t *)win[1];
+ 		for (uint32_t i = 0; i < 0x20000; i += 8) {
+@@ -2587,7 +2591,9 @@ notefe_cam_frame(vm_offset_t pins)
+ 	}
+ 	nc_sensor_write(0x35, 0x0100, 0, 8);
+ 	delay(50000);
+-	nc_make_picture();
++	if (!(skip & 2)) {
++		nc_make_picture();
++	}
+ 	/* receiver down, as found */
+ 	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
+ 	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);

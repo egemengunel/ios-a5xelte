@@ -1,0 +1,63 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: charger input limit to 1500 mA (as Android on this cable); csops log only on failures
+
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 4b0364a..391a123 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -243,13 +243,32 @@ herolte_chg_poll(bool *external, bool *charging, bool *full)
+ 	if (kick && (c0 & CHG_WDTEN) && cool) {
+ 		kicked = chg_write(CHG_CNFG_06, (uint8_t)(c6 | CHG_WDTCLR));
+ 	}
++	/*
++	 * Note FE 0411: S-Boot leaves the input current limit at 500 mA (CNFG_09 0x0f, 33.3 mA steps), less than the phone
++	 * uses with the screen on: "charging" while the gauge reads -55 mA (boot 6). Android's driver set 0x2d (1500 mA) on
++	 * the same cable and port in TWRP. With a valid input and the SoC cool, the limit goes to herochgma (default 1500,
++	 * at most 2000; 0 leaves S-Boot's).
++	 */
++	static int ilim_ma = -1;
++	if (ilim_ma < 0) {
++		ilim_ma = 1500;
++		PE_parse_boot_argn("herochgma", &ilim_ma, sizeof(ilim_ma));
++		ilim_ma = ilim_ma > 2000 ? 2000 : ilim_ma;
++	}
++	uint8_t want9 = (uint8_t)(ilim_ma / 33);
++	if (ilim_ma > 0 && ((d0 >> 5) & 3u) == 3u && cool && (c9 & 0x7fu) < want9 && (c6 & 0x0cu) == 0x0cu) {
++		uint8_t n9 = (uint8_t)((c9 & 0x80u) | want9);
++		if (chg_write(CHG_CNFG_09, n9) && chg_byte(CHG_CNFG_09, &c9)) {
++			printf("NOTEFE CHG: input limit %u mA -> %#x (read back %#x)\n", (unsigned)ilim_ma, n9, c9);
++		}
++	}
+ 	unsigned dtls = d1 & 0x0fu;
+ 	*external = ((d0 >> 5) & 3u) == 3u;
+ 	*charging = *external && dtls <= 3u;
+ 	*full = *external && dtls == 4u;
+ 	static unsigned logged;
+-	static uint8_t last_d1 = 0xff, last_c0 = 0xff;
+-	if (logged++ % 10 == 0 || d1 != last_d1 || c0 != last_c0) {
++	static uint8_t last_d1 = 0xff, last_c0 = 0xff, last_d0 = 0xff;
++	if (logged++ % 10 == 0 || d1 != last_d1 || c0 != last_c0 || d0 != last_d0) {
+ 		printf("NOTEFE CHG: in=%u dtls=%#x bat=%u byp=%#x cnfg00=%#x cnfg02=%#x cnfg06=%#x cnfg09=%#x | %s%s (SoC %d C)\n",
+ 		    (d0 >> 5) & 3u, dtls, (d1 >> 4) & 7u, d2 & 0x0fu, c0, c2, c6, c9,
+ 		    !(c0 & CHG_WDTEN) ? "watchdog off" : kicked ? "watchdog cleared" : kick ? "watchdog NOT cleared" : "read only",
+@@ -257,6 +276,7 @@ herolte_chg_poll(bool *external, bool *charging, bool *full)
+ 	}
+ 	last_d1 = d1;
+ 	last_c0 = c0;
++	last_d0 = d0;
+ 	return 0;
+ }
+ 
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 9af8c6f..6eeafce 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3588,7 +3588,7 @@ out:
+ 		extern bool herolte_log_name(const char *name);
+ 		char me[32];
+ 		proc_selfname(me, sizeof(me));
+-		if (herolte_log_name(me) && pt != current_proc()) {
++		if (herolte_log_name(me) && pt != current_proc() && error != 0 && error != ERANGE) {    /* 0411: failures only */
+ 			static unsigned logged;
+ 			if (logged++ < 400) {
+ 				struct cs_blob *b = csproc_get_blob(pt);

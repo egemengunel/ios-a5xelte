@@ -1,3 +1,45 @@
+# iOS 16 on the Samsung Galaxy Note FE (SM-N935F, Exynos 8890) — `gracerlte` branch
+
+**Status, 2026-11-15:** the Galaxy S7 port below (`herolte`) runs on the Galaxy Note FE (Note 7 Fan Edition,
+`gracerlte`): the unmodified **iPhone X iOS 16.7.16 userland** to the home screen with GPU acceleration, Wi-Fi and
+sound, plus **Bluetooth** (Settings lists nearby devices) and the **front camera live in the Camera app**. Same SoC as
+the S7, so most of the port carries over; the differences (panel address, camera, Bluetooth chip, power) are kernel
+patches `0400` and up and the `gracerlte/` folder.
+
+**Try it:** [docs/gracerlte-howto.md](docs/gracerlte-howto.md). As for the S7, nothing of Apple's, Samsung's or
+Broadcom's is in this repository: the iOS root comes from Apple's IPSW, built by you; firmware and the BOOT header come
+from your own phone.
+
+| Area | State |
+| --- | --- |
+| Boot | S-Boot loads our loader from BOOT (`gracerlte/loader/`); the Note FE's panel scans out at `0xd8000000`, not the S7's `0xe2a00000` (0400) |
+| CPU | All 8 cores. Mongoose at 2288 MHz with a **load governor** (0469-0470, `herogov=1`): down to 728 MHz after 2 s idle, straight back up when busy. SoC at idle 39-41 C instead of 44-45 C, Control Center unchanged (~33 fps) |
+| Background load | Widget extensions capped (`herowidgetcap=8`) and `herocap=name:percent` for any daemon (0465; `coreduetd:20`): idle CPU about half (518% -> 261% of 800%) |
+| RAM | About 3.3 GiB (`docs/gracerlte-ram.md`) |
+| GPU, display | As the S7: Mali-T880 through OpenGL ES, iPhone 8 screen (750x1334) scaled to the 1440x2560 panel |
+| Wi-Fi | Murata module: the S7 path with `nvram.txt_murata_c0_plus` from the phone |
+| Bluetooth | BCM4359C0 over UART1, Apple's bluetoothd through an in-kernel HCI bridge (0432-0436): powered on, scans, Settings lists devices. Started by the test program for now (`gracerlte/bot`) |
+| Camera | **Front S5K4E6**: sensor -> MIPI CSIS2 -> DMA -> `/dev/hakios-camera` (0437-0468) -> the S9 port's capture device in mediaserverd (`gracerlte/camera`, MIT) -> Camera app preview, ~15 fps. Colours off (sensor red/blue weak), a cropped field of view. Rear cameras (behind the 73C3 companion) not started. `docs/gracerlte-camera.md` |
+| IOSurface | 0464: a planar surface's bytes-per-row moved to iOS 16's offset; every YUV surface had a row of 0 |
+| Fail-safe | Hardware watchdog (`notefe_wdt=2`, 0437-0438): a hang resets the phone into TWRP |
+| Apps | Unencrypted IPAs through the drop zone (`app=`), as on the S7. App Store apps are FairPlay-encrypted and cannot run |
+| Not working | modem, sensors, sleep, Face ID, Metal, rear cameras, the wallpaper picker's thumbnails |
+
+Thanks to [wardevsa](https://github.com/wardevsa/ios-a5xelte) for the S7 port this builds on, and to everyone credited
+below. The camera's capture device and ISP are from
+[danstronics/ios-s9plus-exynos](https://github.com/danstronics/ios-s9plus-exynos) (`gracerlte/camera/LICENSE.HakiOS`);
+the Bluetooth bridge follows [coreycusick/ios-guacamole](https://github.com/coreycusick/ios-guacamole/tree/sweet-bluetooth-audio)'s Bluetooth work (transport, controls), notes collected in `docs/gracerlte-community.md`;
+register facts for the 4E6 come from the MediaTek and Allwinner drivers and the LineageOS Exynos 8890 kernel (read for
+facts only). Progress, boot by boot: [GRACERLTE_PROGRESS.md](GRACERLTE_PROGRESS.md). What is next:
+[docs/gracerlte-roadmap.md](docs/gracerlte-roadmap.md).
+
+Kernel patches for the Note FE are `xnu/patches/0400` and up, on top of the S7's (same `MACHINE_CONFIG=HEROLTE`).
+Help is welcome: open an issue with the log (`gracerlte/pull-log.sh`) and a photo of the screen.
+
+Based on [wardevsa/ios-a5xelte](https://github.com/wardevsa/ios-a5xelte) (`herolte`, Galaxy S7), documented below.
+
+---
+
 # iOS 16 on the Samsung Galaxy S7 (SM-G930F, Exynos 8890) — `herolte` branch
 
 **Status, 2026-11-07:** Apple's XNU kernel boots on a flat Galaxy S7 and runs the

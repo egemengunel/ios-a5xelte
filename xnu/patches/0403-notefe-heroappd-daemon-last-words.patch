@@ -1,0 +1,48 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: heroappd=name,... puts libheroapp into named daemons too
+
+libheroapp (drop zone) logs an uncaught Objective-C exception's name and reason,
+but only goes into /Applications/ and poster extensions. assetsd (Photos) and
+mediaserverd (media) abort with "uncaught exception" and no text. By default
+(heroappd=assetsd,mediaserverd, no boot-line space) their reasons reach the log; heroappd=- for none.
+---
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 3cb1dc2..8e78c52 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -170,6 +170,35 @@ herolte_gl_env(const char *path, int pid, const char **extra, int max)
+ 		}
+ 		in_applications = appex && poster;
+ 	}
++	/*
++	 * Note FE 0403: boot-arg heroappd=name,name (default assetsd,mediaserverd; - for none): daemons that get libheroapp too, for their last words in this log
++	 * (assetsd and mediaserverd die of an uncaught exception with only "abort" here). Matched on the file name.
++	 */
++	if (!in_applications && path != NULL) {
++		static char appd[128];
++		static int appd_read;
++		if (!appd_read) {
++			appd_read = 1;
++			if (!PE_parse_boot_argn("heroappd", appd, sizeof(appd))) {
++				strlcpy(appd, "assetsd,mediaserverd", sizeof(appd));    /* the default: no room left on the boot line */
++			}
++			if (appd[0] == '-') {
++				appd[0] = '\0';                                        /* heroappd=- : none */
++			}
++		}
++		const char *base = strrchr(path, '/');
++		base = base ? base + 1 : path;
++		size_t n = strlen(base);
++		for (const char *t = appd; *t != '\0' && !in_applications;) {
++			const char *end = strchr(t, ',');
++			size_t tl = end ? (size_t)(end - t) : strlen(t);
++			in_applications = tl == n && n > 0 && strncmp(t, base, n) == 0;
++			if (!end) {
++				break;
++			}
++			t = end + 1;
++		}
++	}
+ 	if (in_applications && max >= 1) {
+ 		vnode_t appvp = NULLVP;
+ 		if (vnode_lookup(HGL_APP_LIB, 0, &appvp, vfs_context_kernel()) == 0) {

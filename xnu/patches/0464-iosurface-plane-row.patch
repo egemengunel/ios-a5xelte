@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bc04ace..7a0bd43 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -639,7 +639,12 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		/*
++		 * Note FE 0464: iOS 16's IOSurfaceClient reads a plane's bytes per row at +0x10 of its entry (client +0xe0 +
++		 * i*0x80, _IOSurfaceClientGetBytesPerRowOfPlane, 20H392), not +0x08: every planar surface had 0, so a
++		 * camera picture was written row upon row into its first row and the rest stayed 0 (green preview).
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);

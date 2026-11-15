@@ -1,0 +1,676 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index ffb54a1..85d3118 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -825,6 +825,641 @@ notefe_bt_fw_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_bt_fw, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_bt_fw_sysctl, "S", "Note FE: the Bluetooth chip's .hcd patch (root writes it)");
+ 
++/*
++ * Note FE (0435): Bluetooth step 5, iOS's transport with the bridge in the kernel. `sysctl kern.notefe_bt=8` (root)
++ * does steps 2-4 (UART, power, the chip's patch), then registers the kernel controls an iPhone X's UART Bluetooth has
++ * and starts the bridge thread. The controls and the Skywalk kernel-pipe channel are ios-guacamole's 0220-0222
++ * (sweet_btuart.c, OnePlus 7 Pro; reverse engineering in its research/bluetooth/transport.md): BlueTool connects to
++ * PF_SYSTEM "com.apple.uart.bluetooth", bluetoothd's H4BC transport to "com.apple.uart.sk.bluetooth" and asks it for a
++ * channel (setsockopt 0x800c5414, getsockopt 0x40105412 = nexus UUID, os_channel_create); termios options are kept
++ * and answered. Where guacamole joins them to a userland bridge (btbridge over /dev/pmem, a CPU-polling process), here
++ * the bridge is a kernel thread on UART1 that sleeps 1 ms when there is nothing to move. The chip is a real Broadcom,
++ * so unlike guacamole's Qualcomm almost everything goes to it. Answered here (guacamole's findings, NOTES.md
++ * 2026-11-09): BlueTool's download and link commands (0xfc18 baud, 0xfc2e/0xfc4c/0xfc4e the patch, 0xfc27 sleep mode,
++ * 0xfc45 UART clock: the chip already runs our patch at 115200), LE_Read_Periodic_Advertiser_List_Size 0x204a (it
++ * switches the chip to extended advertising, where bluetoothd's legacy LE scan is refused). Rewritten on the way back:
++ * Read_Local_Version as BlueTool's BCM4357B1 (HCI/LMP 9, manufacturer 0x000f, subversion 0x420e: getChipset picks its
++ * D22 boot script by it), Read_Local_Supported_Commands octet 18 bits 2-3 (Write_Default_Erroneous_Data_Reporting,
++ * which bluetoothd otherwise fails locally), and any Command Complete with status 0x01 (unknown command: Apple's own
++ * vendor commands) turned into success with the first parameter echoed and 15 zero bytes (bcm_vsc.c asserts on a
++ * reply that has only a status). Klog `NOTEFE BT:` (connects, channel, counters every 60 s, the first 40 commands).
++ */
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/termios.h>
++#include <skywalk/os_skywalk_private.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++static LCK_GRP_DECLARE(nbt_grp, "notefe_bt");
++static LCK_MTX_DECLARE(nbt_lock, &nbt_grp);
++static vm_offset_t nbt_uart;
++static bool nbt_running;
++static kern_ctl_ref nbt_ios_ref, nbt_sk_ref, nbt_ios_cur;
++static u_int32_t nbt_ios_unit;
++static struct termios nbt_termios;
++static uint64_t nbt_to_chip, nbt_to_ios, nbt_lost, nbt_local, nbt_fixed, nbt_resync;
++static unsigned nbt_logged;
++#define NBT_TXQ 32768
++static uint8_t nbt_txq[NBT_TXQ];                /* iOS -> chip, not yet parsed */
++static size_t nbt_txq_len;
++static uint8_t nbt_vsc_sub[1024];               /* first parameter of the last vendor command per OCF */
++
++/* ---- guacamole 0222: the Skywalk kernel-pipe channel for bluetoothd ---- */
++#define NBT_OPT_CHANNEL_OPEN   0x800c5414u
++#define NBT_OPT_CHANNEL_UUID   0x40105412u
++#define NBT_SLOT_SIZE          2048
++#define NBT_RING_SLOTS         64
++#define NBT_PENDING            (64 * 1024)
++static nexus_controller_t nbt_ncd;
++static uuid_t nbt_prov_uuid, nbt_inst_uuid;
++static kern_pbufpool_t nbt_pp;
++static kern_channel_ring_t nbt_rxring, nbt_txring;
++static bool nbt_chan;
++static uint8_t nbt_pending[NBT_PENDING];
++static size_t nbt_pend_head, nbt_pend_len;
++static void nbt_from_ios(const void *buf, size_t n);
++
++static errno_t
++nbt_pre_connect(__unused kern_nexus_provider_t nxprov, __unused proc_t p, __unused kern_nexus_t nexus,
++    __unused nexus_port_t port, __unused kern_channel_t channel, __unused void **ch_ctx)
++{
++	return 0;
++}
++
++static errno_t
++nbt_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	printf("NOTEFE BT: channel connected\n");
++	return 0;
++}
++
++static void
++nbt_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++}
++
++static void
++nbt_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	printf("NOTEFE BT: channel disconnected\n");
++}
++
++static errno_t
++nbt_ring_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel,
++    kern_channel_ring_t ring, boolean_t is_tx_ring, __unused void **ring_ctx)
++{
++	lck_mtx_lock(&nbt_lock);
++	if (is_tx_ring) {
++		nbt_txring = ring;
++	} else {
++		nbt_rxring = ring;
++	}
++	lck_mtx_unlock(&nbt_lock);
++	return 0;
++}
++
++static void
++nbt_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring)
++{
++	lck_mtx_lock(&nbt_lock);
++	if (nbt_rxring == ring) {
++		nbt_rxring = NULL;
++	} else if (nbt_txring == ring) {
++		nbt_txring = NULL;
++	}
++	lck_mtx_unlock(&nbt_lock);
++}
++
++static errno_t
++nbt_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t tx_ring,
++    __unused uint32_t flags)
++{
++	kern_channel_slot_t pslot = NULL, slot = kern_channel_get_next_slot(tx_ring, NULL, NULL);
++	struct kern_channel_ring_stat_increment stats = {};
++	while (slot != NULL) {
++		kern_packet_t ph = kern_channel_slot_get_packet(tx_ring, slot);
++		pslot = slot;
++		slot = kern_channel_get_next_slot(tx_ring, slot, NULL);
++		if (ph == 0) {
++			continue;
++		}
++		kern_buflet_t buf = kern_packet_get_next_buflet(ph, NULL);
++		uint8_t *addr = buf ? (uint8_t *)kern_buflet_get_data_address(buf) : NULL;
++		if (addr == NULL) {
++			continue;
++		}
++		addr += kern_buflet_get_data_offset(buf);
++		size_t len = MIN(kern_packet_get_data_length(ph), NBT_SLOT_SIZE);
++		nbt_from_ios(addr, len);
++		stats.kcrsi_slots_transferred++;
++		stats.kcrsi_bytes_transferred += len;
++	}
++	if (pslot != NULL) {
++		kern_channel_advance_slot(tx_ring, pslot);
++		kern_channel_increment_ring_stats(tx_ring, &stats);
++		(void) kern_channel_reclaim(tx_ring);
++	}
++	return 0;
++}
++
++static errno_t
++nbt_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t rx_ring,
++    __unused uint32_t flags)
++{
++	struct kern_channel_ring_stat_increment stats = {};
++	(void) kern_channel_reclaim(rx_ring);
++	if (kern_channel_available_slot_count(rx_ring) == 0) {
++		return 0;
++	}
++	struct kern_pbufpool *pp = rx_ring->ckr_pp;
++	kern_channel_slot_t pslot = NULL, slot = kern_channel_get_next_slot(rx_ring, NULL, NULL);
++	while (slot != NULL) {
++		kern_packet_t ph = 0;
++		if (nbt_pend_len == 0 || kern_pbufpool_alloc_nosleep(pp, 1, &ph) != 0) {
++			break;
++		}
++		kern_buflet_t buf = kern_packet_get_next_buflet(ph, NULL);
++		uint8_t *addr = buf ? (uint8_t *)kern_buflet_get_data_address(buf) : NULL;
++		if (addr == NULL) {
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		size_t n = 0;
++		lck_mtx_lock(&nbt_lock);
++		while (n < NBT_SLOT_SIZE && n < PP_BUF_SIZE_DEF(pp) && nbt_pend_len > 0) {
++			size_t run = MIN(MIN(nbt_pend_len, NBT_PENDING - nbt_pend_head),
++			    MIN((size_t)NBT_SLOT_SIZE, (size_t)PP_BUF_SIZE_DEF(pp)) - n);
++			memcpy(addr + n, nbt_pending + nbt_pend_head, run);
++			n += run;
++			nbt_pend_head = (nbt_pend_head + run) % NBT_PENDING;
++			nbt_pend_len -= run;
++		}
++		lck_mtx_unlock(&nbt_lock);
++		kern_buflet_set_data_offset(buf, 0);
++		kern_buflet_set_data_length(buf, (uint32_t)n);
++		kern_packet_finalize(ph);
++		if (kern_channel_slot_attach_packet(rx_ring, slot, ph) != 0) {
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		stats.kcrsi_slots_transferred++;
++		stats.kcrsi_bytes_transferred += n;
++		pslot = slot;
++		slot = kern_channel_get_next_slot(rx_ring, slot, NULL);
++	}
++	if (pslot != NULL) {
++		kern_channel_advance_slot(rx_ring, pslot);
++		kern_channel_increment_ring_stats(rx_ring, &stats);
++	}
++	return 0;
++}
++
++static errno_t
++nbt_channel_open(void)
++{
++	errno_t e;
++	if (nbt_ncd == NULL) {
++		uuid_t dom;
++		nexus_attr_t nxa = NULL;
++		struct kern_nexus_provider_init prov = {
++			.nxpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,
++			.nxpi_flags = NXPIF_VIRTUAL_DEVICE,
++			.nxpi_pre_connect = nbt_pre_connect,
++			.nxpi_connected = nbt_connected,
++			.nxpi_pre_disconnect = nbt_pre_disconnect,
++			.nxpi_disconnected = nbt_disconnected,
++			.nxpi_ring_init = nbt_ring_init,
++			.nxpi_ring_fini = nbt_ring_fini,
++			.nxpi_sync_tx = nbt_sync_tx,
++			.nxpi_sync_rx = nbt_sync_rx,
++		};
++		if ((e = kern_nexus_controller_create(&nbt_ncd)) != 0) {
++			nbt_ncd = NULL;
++			return e;
++		}
++		if ((e = kern_nexus_get_default_domain_provider(NEXUS_TYPE_KERNEL_PIPE, &dom)) != 0 ||
++		    (e = kern_nexus_attr_create(&nxa)) != 0) {
++			return e;
++		}
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_SLOT_BUF_SIZE, NBT_SLOT_SIZE);
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_SLOTS, NBT_RING_SLOTS);
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_SLOTS, NBT_RING_SLOTS);
++		e = kern_nexus_controller_register_provider(nbt_ncd, dom, (const uint8_t *)"com.notefe.nexus.bt.kpipe",
++		    &prov, sizeof(prov), nxa, &nbt_prov_uuid);
++		kern_nexus_attr_destroy(nxa);
++		if (e != 0) {
++			kern_nexus_controller_destroy(nbt_ncd);
++			nbt_ncd = NULL;
++			return e;
++		}
++	}
++	if (nbt_chan) {
++		return 0;
++	}
++	struct kern_pbufpool_init ppi;
++	bzero(&ppi, sizeof(ppi));
++	ppi.kbi_version = KERN_PBUFPOOL_CURRENT_VERSION;
++	ppi.kbi_flags = KBIF_VIRTUAL_DEVICE | KBIF_QUANTUM;
++	ppi.kbi_packets = NBT_RING_SLOTS * 4;
++	ppi.kbi_bufsize = NBT_SLOT_SIZE;
++	ppi.kbi_buf_seg_size = skmem_usr_buf_seg_size;
++	ppi.kbi_max_frags = 1;
++	(void) snprintf((char *)ppi.kbi_name, sizeof(ppi.kbi_name), "com.notefe.kpipe.bt");
++	if ((e = kern_pbufpool_create(&ppi, &nbt_pp, NULL)) != 0) {
++		nbt_pp = NULL;
++		return e;
++	}
++	struct kern_nexus_init init;
++	bzero(&init, sizeof(init));
++	init.nxi_version = KERN_NEXUS_CURRENT_VERSION;
++	init.nxi_tx_pbufpool = nbt_pp;
++	if ((e = kern_nexus_controller_alloc_provider_instance(nbt_ncd, nbt_prov_uuid, NULL, NULL, &nbt_inst_uuid,
++	    &init)) != 0) {
++		kern_pbufpool_destroy(nbt_pp);
++		nbt_pp = NULL;
++		return e;
++	}
++	nexus_port_t port = NEXUS_PORT_KERNEL_PIPE_CLIENT;
++	if ((e = kern_nexus_controller_bind_provider_instance(nbt_ncd, nbt_inst_uuid, &port, proc_selfpid(), NULL, NULL,
++	    0, NEXUS_BIND_PID)) != 0) {
++		kern_nexus_controller_free_provider_instance(nbt_ncd, nbt_inst_uuid);
++		uuid_clear(nbt_inst_uuid);
++		kern_pbufpool_destroy(nbt_pp);
++		nbt_pp = NULL;
++		return e;
++	}
++	lck_mtx_lock(&nbt_lock);
++	nbt_pend_head = nbt_pend_len = 0;
++	nbt_chan = true;
++	lck_mtx_unlock(&nbt_lock);
++	printf("NOTEFE BT: channel open for pid %d\n", proc_selfpid());
++	return 0;
++}
++
++static void
++nbt_channel_close(void)
++{
++	lck_mtx_lock(&nbt_lock);
++	bool was = nbt_chan;
++	nbt_chan = false;
++	lck_mtx_unlock(&nbt_lock);
++	if (!was) {
++		return;
++	}
++	if (kern_nexus_controller_free_provider_instance(nbt_ncd, nbt_inst_uuid) == 0 && nbt_pp != NULL) {
++		kern_pbufpool_destroy(nbt_pp);
++		nbt_pp = NULL;
++	}
++	uuid_clear(nbt_inst_uuid);
++	printf("NOTEFE BT: channel closed\n");
++}
++
++/* chip -> iOS: bluetoothd's channel, else the latest socket */
++static void
++nbt_to_ios_bytes(const uint8_t *buf, size_t n)
++{
++	lck_mtx_lock(&nbt_lock);
++	bool channel = nbt_chan && nbt_ios_cur == nbt_sk_ref;
++	kern_ctl_ref ref = nbt_ios_cur;
++	u_int32_t unit = nbt_ios_unit;
++	kern_channel_ring_t rx = nbt_rxring;
++	if (channel) {
++		size_t room = NBT_PENDING - nbt_pend_len, k = MIN(n, room);
++		for (size_t i = 0; i < k; i++) {
++			nbt_pending[(nbt_pend_head + nbt_pend_len + i) % NBT_PENDING] = buf[i];
++		}
++		nbt_pend_len += k;
++		nbt_lost += n - k;
++		nbt_to_ios += k;
++	}
++	lck_mtx_unlock(&nbt_lock);
++	if (channel) {
++		if (rx != NULL) {
++			kern_channel_notify(rx, 0);
++		}
++	} else if (unit == 0 || ctl_enqueuedata(ref, unit, (void *)(uintptr_t)buf, n, 0) != 0) {
++		nbt_lost += n;
++	} else {
++		nbt_to_ios += n;
++	}
++}
++
++/* iOS -> the bridge thread's queue */
++static void
++nbt_from_ios(const void *buf, size_t n)
++{
++	lck_mtx_lock(&nbt_lock);
++	size_t k = MIN(n, NBT_TXQ - nbt_txq_len);
++	memcpy(nbt_txq + nbt_txq_len, buf, k);
++	nbt_txq_len += k;
++	nbt_lost += n - k;
++	lck_mtx_unlock(&nbt_lock);
++	thread_wakeup((event_t)&nbt_txq_len);
++}
++
++static void
++nbt_complete(uint16_t op, const uint8_t *params, unsigned n)
++{
++	uint8_t ev[64] = { 0x04, 0x0e, (uint8_t)(4 + n), 0x01, (uint8_t)op, (uint8_t)(op >> 8), 0x00 };
++	if (n > sizeof(ev) - 7) {
++		n = sizeof(ev) - 7;
++	}
++	if (n) {
++		memcpy(ev + 7, params, n);
++	}
++	nbt_local++;
++	nbt_to_ios_bytes(ev, 7 + n);
++}
++
++/* one command from iOS: answered here or sent to the chip */
++static void
++nbt_command(const uint8_t *p, size_t len)
++{
++	uint16_t op = (uint16_t)(p[1] | p[2] << 8);
++	bool local = op == 0xfc18 || op == 0xfc2e || op == 0xfc4c || op == 0xfc4e || op == 0xfc27 || op == 0xfc45;
++	if (nbt_logged < 40 && op != 0xfc4c) {
++		nbt_logged++;
++		notefe_hex(local ? "iOS cmd (answered here)" : "iOS cmd", p, (unsigned)len);
++	}
++	if (local) {
++		nbt_complete(op, NULL, 0);
++		return;
++	}
++	if (op == 0x204a) {
++		uint8_t size = 3;
++		nbt_complete(op, &size, 1);
++		return;
++	}
++	if ((op >> 10) == 0x3f) {
++		nbt_vsc_sub[op & 0x3ff] = len > 4 ? p[4] : 0;
++	}
++	if (notefe_uart_write(nbt_uart, p, (unsigned)len)) {
++		nbt_to_chip += len;
++	} else {
++		nbt_lost += len;
++	}
++}
++
++/* one event from the chip, fixed where iOS expects an Apple chip, then to iOS */
++static void
++nbt_event(uint8_t *p, size_t len)
++{
++	if (p[1] == 0x0e && len >= 7) {
++		uint16_t op = (uint16_t)(p[4] | p[5] << 8);
++		if (op == 0x1001 && len >= 15 && p[6] == 0) {
++			p[7] = 9;
++			p[10] = 9;
++			p[11] = 0x0f;
++			p[12] = 0x00;
++			p[13] = 0x0e;
++			p[14] = 0x42;
++			nbt_fixed++;
++		} else if (op == 0x1002 && len >= 7 + 19 && p[6] == 0) {
++			p[7 + 18] |= 0x0c;
++			nbt_fixed++;
++		} else if (p[6] == 0x01) {
++			uint8_t params[16] = { (op >> 10) == 0x3f ? nbt_vsc_sub[op & 0x3ff] : 0 };
++			if (nbt_logged < 40) {
++				nbt_logged++;
++				printf("NOTEFE BT: chip: unknown command %#06x -> success for iOS\n", op);
++			}
++			nbt_fixed++;
++			nbt_complete(op, params, sizeof(params));
++			return;
++		}
++	}
++	nbt_to_ios_bytes(p, len);
++}
++
++/* bytes of one H4 stream (either way): the length of the first complete packet, 0 if incomplete, -1 if junk */
++static long
++nbt_h4_len(const uint8_t *b, size_t n, bool from_chip)
++{
++	if (n < 1) {
++		return 0;
++	}
++	switch (b[0]) {
++	case 0x01:
++		return from_chip ? -1 : (n < 4 ? 0 : (n < 4u + b[3] ? 0 : 4 + b[3]));
++	case 0x02:
++		if (n < 5) {
++			return 0;
++		}
++		{
++			size_t l = (size_t)(b[3] | b[4] << 8);
++			if (l > 4096) {
++				return -1;
++			}
++			return n < 5 + l ? 0 : (long)(5 + l);
++		}
++	case 0x03:
++		return n < 4 ? 0 : (n < 4u + b[3] ? 0 : 4 + b[3]);
++	case 0x04:
++		return !from_chip ? -1 : (n < 3 ? 0 : (n < 3u + b[2] ? 0 : 3 + b[2]));
++	default:
++		return -1;
++	}
++}
++
++static void
++nbt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static uint8_t cmd[NBT_TXQ], rx[8192];
++	size_t cmd_len = 0, rx_len = 0;
++	uint64_t last_report = mach_absolute_time(), ns;
++	for (;;) {
++		bool busy = false;
++		lck_mtx_lock(&nbt_lock);
++		size_t k = MIN(nbt_txq_len, sizeof(cmd) - cmd_len);
++		memcpy(cmd + cmd_len, nbt_txq, k);
++		memmove(nbt_txq, nbt_txq + k, nbt_txq_len - k);
++		nbt_txq_len -= k;
++		lck_mtx_unlock(&nbt_lock);
++		cmd_len += k;
++		for (;;) {
++			long l = nbt_h4_len(cmd, cmd_len, false);
++			if (l == 0) {
++				break;
++			}
++			if (l < 0) {
++				memmove(cmd, cmd + 1, --cmd_len);
++				nbt_resync++;
++				continue;
++			}
++			if (cmd[0] == 0x01) {
++				nbt_command(cmd, (size_t)l);
++			} else if (notefe_uart_write(nbt_uart, cmd, (unsigned)l)) {
++				nbt_to_chip += (uint64_t)l;
++			}
++			memmove(cmd, cmd + l, cmd_len - (size_t)l);
++			cmd_len -= (size_t)l;
++			busy = true;
++		}
++		unsigned got = notefe_uart_read(nbt_uart, rx + rx_len, (unsigned)(sizeof(rx) - rx_len), 1, 0);
++		rx_len += got;
++		busy = busy || got;
++		for (;;) {
++			long l = nbt_h4_len(rx, rx_len, true);
++			if (l == 0) {
++				break;
++			}
++			if (l < 0) {
++				memmove(rx, rx + 1, --rx_len);
++				nbt_resync++;
++				continue;
++			}
++			if (rx[0] == 0x04) {
++				nbt_event(rx, (size_t)l);
++			} else {
++				nbt_to_ios_bytes(rx, (size_t)l);
++			}
++			memmove(rx, rx + l, rx_len - (size_t)l);
++			rx_len -= (size_t)l;
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - last_report, &ns);
++		if (ns > 60ull * NSEC_PER_SEC) {
++			last_report = mach_absolute_time();
++			printf("NOTEFE BT: bridge: %llu bytes to the chip, %llu to iOS, %llu answered here, %llu fixed, "
++			    "%llu lost, %llu resyncs\n", nbt_to_chip, nbt_to_ios, nbt_local, nbt_fixed, nbt_lost, nbt_resync);
++		}
++		if (!busy) {
++			assert_wait_timeout((event_t)&nbt_txq_len, THREAD_UNINT, 1000, NSEC_PER_USEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
++static errno_t
++nbt_ios_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **info)
++{
++	char who[32] = "";
++	proc_selfname(who, sizeof(who));
++	lck_mtx_lock(&nbt_lock);
++	nbt_ios_unit = sac->sc_unit;
++	nbt_ios_cur = ref;
++	lck_mtx_unlock(&nbt_lock);
++	printf("NOTEFE BT: %s connected to %s (unit %u)\n", who, ref == nbt_sk_ref ? "uart.sk" : "uart", sac->sc_unit);
++	return 0;
++}
++
++static errno_t
++nbt_ios_disconnect(kern_ctl_ref ref, u_int32_t unit, __unused void *info)
++{
++	lck_mtx_lock(&nbt_lock);
++	if (nbt_ios_unit == unit && nbt_ios_cur == ref) {
++		nbt_ios_unit = 0;
++	}
++	lck_mtx_unlock(&nbt_lock);
++	if (ref == nbt_sk_ref) {
++		nbt_channel_close();
++	}
++	printf("NOTEFE BT: unit %u disconnected (%llu bytes to the chip, %llu to iOS, %llu lost)\n", unit, nbt_to_chip,
++	    nbt_to_ios, nbt_lost);
++	return 0;
++}
++
++static errno_t
++nbt_ios_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, mbuf_t m, __unused int flags)
++{
++	char buf[512];
++	size_t len = mbuf_pkthdr_len(m), off = 0;
++	while (off < len) {
++		size_t n = MIN(len - off, sizeof(buf));
++		if (mbuf_copydata(m, off, n, buf) != 0) {
++			break;
++		}
++		nbt_from_ios(buf, n);
++		off += n;
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++nbt_ios_setopt(kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, int opt, void *data, size_t len)
++{
++	if ((u_int32_t)opt == NBT_OPT_CHANNEL_OPEN) {
++		errno_t e = ref == nbt_sk_ref ? nbt_channel_open() : ENOTSUP;
++		if (e != 0) {
++			printf("NOTEFE BT: channel open failed: %d\n", e);
++		}
++		return e;
++	}
++	if (data != NULL && len == sizeof(nbt_termios)) {
++		lck_mtx_lock(&nbt_lock);
++		memcpy(&nbt_termios, data, len);
++		lck_mtx_unlock(&nbt_lock);
++	}
++	return 0;
++}
++
++static errno_t
++nbt_ios_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, int opt, void *data,
++    size_t *len)
++{
++	if ((u_int32_t)opt == NBT_OPT_CHANNEL_UUID) {
++		if (data == NULL) {
++			*len = sizeof(uuid_t);
++			return 0;
++		}
++		if (!nbt_chan || *len < sizeof(uuid_t)) {
++			return ENXIO;
++		}
++		uuid_copy(data, nbt_inst_uuid);
++		*len = sizeof(uuid_t);
++		return 0;
++	}
++	if (data == NULL) {
++		*len = sizeof(nbt_termios);
++		return 0;
++	}
++	size_t n = MIN(*len, sizeof(nbt_termios));
++	lck_mtx_lock(&nbt_lock);
++	memcpy(data, &nbt_termios, n);
++	lck_mtx_unlock(&nbt_lock);
++	*len = n;
++	return 0;
++}
++
++static void
++notefe_bt_service(vm_offset_t uart)
++{
++	if (nbt_running) {
++		printf("NOTEFE BT: transport already running\n");
++		return;
++	}
++	nbt_uart = uart;
++	nbt_termios.c_cflag = CS8 | CREAD | CLOCAL;
++	nbt_termios.c_ispeed = nbt_termios.c_ospeed = 115200;
++	struct kern_ctl_reg ios = {
++		.ctl_name = "com.apple.uart.bluetooth",
++		.ctl_flags = CTL_FLAG_REG_SOCK_STREAM,
++		.ctl_sendsize = 64 * 1024,
++		.ctl_recvsize = 64 * 1024,
++		.ctl_connect = nbt_ios_connect,
++		.ctl_disconnect = nbt_ios_disconnect,
++		.ctl_send = nbt_ios_send,
++		.ctl_setopt = nbt_ios_setopt,
++		.ctl_getopt = nbt_ios_getopt,
++	};
++	struct kern_ctl_reg sk = ios;
++	strlcpy(sk.ctl_name, "com.apple.uart.sk.bluetooth", sizeof(sk.ctl_name));
++	errno_t e1 = ctl_register(&ios, &nbt_ios_ref);
++	errno_t e2 = ctl_register(&sk, &nbt_sk_ref);
++	thread_t th;
++	kern_return_t kr = kernel_thread_start(nbt_thread, NULL, &th);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(th);
++		nbt_running = true;
++	}
++	printf("NOTEFE BT: transport: com.apple.uart.bluetooth (%d), com.apple.uart.sk.bluetooth (%d), bridge thread %d\n",
++	    e1, e2, kr);
++}
++
+ static void
+ notefe_bt_probe(int level)
+ {
+@@ -863,7 +1498,10 @@ notefe_bt_probe(int level)
+ 		    notefe_rd(uart, o + 8), notefe_rd(uart, o + 12));
+ 	}
+ 	if (level >= 3) {
+-		notefe_bt_up(level, top, pins, pins_i, uart);
++		notefe_bt_up(level == 8 ? 7 : level, top, pins, pins_i, uart);
++	}
++	if (level == 8) {
++		notefe_bt_service(uart);
+ 	}
+ }
+ 
+@@ -879,7 +1517,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 7) {
++	if (value < 1 || value > 8) {
+ 		return EINVAL;
+ 	}
+ 	notefe_bt_last = value;
+@@ -888,7 +1526,7 @@ notefe_bt_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth (1-2 read only, 3 UART loopback, 4 chip power, 5 HCI version, 6 chip off, 7 + patch)");
++    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth (1-2 read only, 3 UART loopback, 4 chip power, 5 HCI version, 6 chip off, 7 + patch, 8 + iOS transport)");
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");

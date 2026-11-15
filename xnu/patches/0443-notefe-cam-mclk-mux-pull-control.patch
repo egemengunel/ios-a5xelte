@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 7ada91d..84024bd 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1908,19 +1908,69 @@ notefe_cam_probe(int level)
+  * voltage bits kept as found, enable bit off.
+  */
+ static unsigned NC_SDA = 2, NC_SCL = 3;      /* 0439: swapped too in the scan */
++static uint32_t NC_BANK = 0x140;             /* 0443: gpd1 (0x40) for the positive control on the S2MPB02's bus */
+ static vm_offset_t nc_pins;
+ 
++/* 0443: pinctrl@136D0000's banks have 2-bit pull fields (gpc2 reads 0x555 for six pins), not notefe_pin's 4 */
++static void
++nc_pin(vm_offset_t base, uint32_t bank, unsigned pin, int func, int pud, int level)
++{
++	if (level >= 0) {
++		uint32_t dat = notefe_rd(base, bank + 4);
++		notefe_wr(base, bank + 4, level ? (dat | (1u << pin)) : (dat & ~(1u << pin)));
++	}
++	if (pud >= 0) {
++		uint32_t v = notefe_rd(base, bank + 8);
++		notefe_wr(base, bank + 8, (v & ~(3u << (2 * pin))) | ((uint32_t)pud << (2 * pin)));
++	}
++	if (func >= 0) {
++		uint32_t v = notefe_rd(base, bank);
++		notefe_wr(base, bank, (v & ~(0xfu << (4 * pin))) | ((uint32_t)func << (4 * pin)));
++	}
++}
++
+ static void
+ nc_line(unsigned pin, int high)
+ {
+-	notefe_pin(nc_pins, 0x140, pin, high ? 0 : 1, 3, high ? -1 : 0);       /* input (pulled up) or output low */
+-	delay(5);
++	nc_pin(nc_pins, NC_BANK, pin, high ? 0 : 1, -1, high ? -1 : 0);        /* input (board pull-up) or output low */
++	delay(20);
++	if (high && pin == NC_SCL) {                                          /* clock stretching: wait for SCL high */
++		for (unsigned n = 0; n < 1000 && !((notefe_rd(nc_pins, NC_BANK + 4) >> NC_SCL) & 1); n++) {
++			delay(1);
++		}
++	}
+ }
+ 
+ static int
+ nc_sda(void)
+ {
+-	return (notefe_rd(nc_pins, 0x144) >> NC_SDA) & 1;
++	return (notefe_rd(nc_pins, NC_BANK + 4) >> NC_SDA) & 1;
++}
++
++static void nc_start(void);
++static void nc_stop(void);
++static bool nc_byte_out(uint8_t b);
++static uint8_t nc_byte_in(bool ack);
++
++static void
++nc_scan(const char *what)
++{
++	char found[160];
++	int o = 0;
++	found[0] = 0;
++	for (unsigned a = 0x08; a < 0x78; a++) {
++		nc_start();
++		bool ack = nc_byte_out((uint8_t)(a << 1 | 1));
++		if (ack) {
++			(void)nc_byte_in(false);
++		}
++		nc_stop();
++		if (ack && o < (int)sizeof(found) - 8) {
++			o += snprintf(found + o, sizeof(found) - (size_t)o, " %#x", a);
++		}
++	}
++	printf("NOTEFE CAM: scan of %s (bank %#x SDA %u SCL %u): answers at:%s\n", what, NC_BANK, NC_SDA, NC_SCL,
++	    o ? found : " none");
+ }
+ 
+ static void
+@@ -1995,6 +2045,16 @@ static void
+ notefe_cam_front_id(vm_offset_t pins)
+ {
+ 	nc_pins = pins;
++	/* 0443: positive control: the S2MPB02's own bus (gpd1-4 SDA, gpd1-5 SCL) bit-banged must show 0x59 */
++	NC_BANK = 0x40; NC_SDA = 4; NC_SCL = 5;
++	nc_pin(pins, 0x40, 4, 0, -1, -1);
++	nc_pin(pins, 0x40, 5, 0, -1, -1);
++	delay(100);
++	nc_scan("the S2MPB02's bus (control)");
++	nc_pin(pins, 0x40, 4, 2, -1, -1);
++	nc_pin(pins, 0x40, 5, 2, -1, -1);
++	nc_bus_init();
++	NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
+ 	uint8_t l5 = 0, l6 = 0, l13 = 0, l7 = 0;
+ 	if (!nc_read(0x59, 0x22, &l5, 1) || !nc_read(0x59, 0x23, &l6, 1) || !nc_read(0x59, 0x2a, &l13, 1)) {
+ 		printf("NOTEFE CAM: front: the S2MPB02 does not answer, nothing powered\n");
+@@ -2024,8 +2084,8 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	nc_read(0x59, 0x0f, cb, 2);
+ 	printf("NOTEFE CAM: front: BUCK1 %s (ctrl %#x volt %#x), BB %s (ctrl %#x volt %#x)\n", b1_on ? "switched ON" : "left",
+ 	    c1[0], c1[1], bb_on ? "switched ON" : "left", cb[0], cb[1]);
+-	notefe_pin(pins, 0x120, 1, 1, 0, 0);            /* standby low */
+-	notefe_pin(pins, 0x100, 4, 1, 0, 0);            /* reset low */
++	nc_pin(pins, 0x120, 1, 1, 0, 0);            /* standby low */
++	nc_pin(pins, 0x100, 4, 1, 0, 0);            /* reset low */
+ 	nc_line(NC_SDA, 1);
+ 	nc_line(NC_SCL, 1);
+ 	bool p13 = nc_pmic_write(0x2a, 0x80 | 0x5c);
+@@ -2043,16 +2103,25 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	printf("NOTEFE CAM: front: VDDIO_1.8V_CAM (LDO7) %s, was %#x\n", p7 ? "on" : "FAILED", l7);
+ 	printf("NOTEFE CAM: front: VDDA 2.9 V (LDO13) %s %#x, VDDIO 1.8 V (LDO6) %s %#x, VDDD 1.2 V (LDO5) %s %#x\n",
+ 	    p13 ? "on" : "FAILED", r13, p6 ? "on" : "FAILED", r6, p5 ? "on" : "FAILED", r5);
+-	notefe_pin(pins, 0x100, 4, 1, 0, 1);            /* reset high */
++	nc_pin(pins, 0x100, 4, 1, 0, 1);            /* reset high */
+ 	delay(40);
+ 	static vm_offset_t top;
+ 	if (!top) {
+ 		top = ml_io_map(0x10570000u, 0x1000);
+ 	}
+-	uint32_t div = notefe_rd(top, 0xb24);
+-	notefe_wr(top, 0xb24, div & ~0xffu);            /* 0440: SCLK_ISP_SENSOR2 from OSCCLK undivided: 26 MHz (was /4) */
+-	notefe_pin(pins, 0x180, 2, 2, -1, -1);          /* MCLK out */
++	uint32_t div = notefe_rd(top, 0xb24), mux = notefe_rd(top, 0xb20);
++	notefe_wr(top, 0xb20, mux & ~(7u << 12));       /* 0443: select 0 = OSCCLK, the only parent (read 2); bit 21 kept */
++	for (unsigned n = 0; n < 1000 && ((notefe_rd(top, 0xb28) >> 12) & 7) != 0; n++) {
++		delay(1);
++	}
++	notefe_wr(top, 0xb24, div & ~0xffu);            /* 0440: undivided: 26 MHz */
++	printf("NOTEFE CAM: front: MCLK mux %#x -> %#x (status %#x), divider %#x -> %#x\n", mux, notefe_rd(top, 0xb20),
++	    notefe_rd(top, 0xb28), div, notefe_rd(top, 0xb24));
++	nc_pin(pins, 0x180, 2, 2, -1, -1);          /* MCLK out */
+ 	delay(5000);
++	printf("NOTEFE CAM: front: pins: gpc0 con %#x dat %#x, gpc1 con %#x dat %#x, gpk0 con %#x, gpc2 pud %#x\n",
++	    notefe_rd(pins, 0x100), notefe_rd(pins, 0x104), notefe_rd(pins, 0x120), notefe_rd(pins, 0x124),
++	    notefe_rd(pins, 0x180), notefe_rd(pins, 0x148));
+ 	printf("NOTEFE CAM: front: reset high, MCLK on (gpk0 con %#x, divider %#x -> %#x); the lines idle SDA %u SCL %u\n", notefe_rd(pins, 0x180), div, notefe_rd(top, 0xb24),
+ 	    nc_sda(), (notefe_rd(pins, 0x144) >> NC_SCL) & 1);
+ 	/* 0439: each line driven low and read back (is the pin ours, is it pulled up), then every address in both orders */
+@@ -2068,21 +2137,7 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	for (unsigned order = 0; order < 2; order++) {
+ 		NC_SDA = order ? 3 : 2;
+ 		NC_SCL = order ? 2 : 3;
+-		char found[160];
+-		int o = 0;
+-		found[0] = 0;
+-		for (unsigned a = 0x08; a < 0x78; a++) {
+-			nc_start();
+-			bool ack = nc_byte_out((uint8_t)(a << 1 | 1));
+-			if (ack) {
+-				(void)nc_byte_in(false);
+-			}
+-			nc_stop();
+-			if (ack && o < (int)sizeof(found) - 8) {
+-				o += snprintf(found + o, sizeof(found) - (size_t)o, " %#x", a);
+-			}
+-		}
+-		printf("NOTEFE CAM: front: scan with SDA gpc2-%u SCL gpc2-%u: answers at:%s\n", NC_SDA, NC_SCL, o ? found : " none");
++		nc_scan("the front sensor's bus");
+ 		static const uint8_t addrs[] = { 0x35, 0x6a, 0x10, 0x2d, 0x36 };
+ 		for (unsigned a = 0; a < sizeof(addrs); a++) {
+ 			uint8_t id[2] = { 0, 0 }, rev = 0, fc = 0;
+@@ -2099,10 +2154,11 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	NC_SDA = 2;
+ 	NC_SCL = 3;
+ 	/* down again, the reverse */
+-	notefe_pin(pins, 0x180, 2, 0, -1, -1);
++	nc_pin(pins, 0x180, 2, 0, -1, -1);
+ 	notefe_wr(top, 0xb24, div);
+-	notefe_pin(pins, 0x100, 4, 1, 0, 0);
+-	notefe_pin(pins, 0x120, 1, 1, 0, 0);
++	notefe_wr(top, 0xb20, mux);
++	nc_pin(pins, 0x100, 4, 1, 0, 0);
++	nc_pin(pins, 0x120, 1, 1, 0, 0);
+ 	nc_pmic_write(0x24, l7 & 0x7f);
+ 	nc_pmic_write(0x22, l5 & 0x7f);
+ 	delay(2000);
+@@ -2112,8 +2168,8 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	nc_read(0x59, 0x22, &r5, 1);
+ 	nc_read(0x59, 0x23, &r6, 1);
+ 	nc_read(0x59, 0x2a, &r13, 1);
+-	notefe_pin(pins, 0x140, NC_SDA, 0, -1, -1);
+-	notefe_pin(pins, 0x140, NC_SCL, 0, -1, -1);
++	nc_pin(pins, 0x140, NC_SDA, 0, -1, -1);
++	nc_pin(pins, 0x140, NC_SCL, 0, -1, -1);
+ 	if (bb_on) {
+ 		nc_pmic_write(0x0f, bb[0]);
+ 	}

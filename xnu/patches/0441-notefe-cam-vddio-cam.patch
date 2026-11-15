@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 8611d68..ba9dae4 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1995,7 +1995,7 @@ static void
+ notefe_cam_front_id(vm_offset_t pins)
+ {
+ 	nc_pins = pins;
+-	uint8_t l5 = 0, l6 = 0, l13 = 0;
++	uint8_t l5 = 0, l6 = 0, l13 = 0, l7 = 0;
+ 	if (!nc_read(0x59, 0x22, &l5, 1) || !nc_read(0x59, 0x23, &l6, 1) || !nc_read(0x59, 0x2a, &l13, 1)) {
+ 		printf("NOTEFE CAM: front: the S2MPB02 does not answer, nothing powered\n");
+ 		return;
+@@ -2008,11 +2008,16 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	bool p13 = nc_pmic_write(0x2a, 0x80 | 0x5c);
+ 	bool p6 = nc_pmic_write(0x23, 0x80 | 0x30);
+ 	bool p5 = nc_pmic_write(0x22, 0x80 | 0x30);
++	/* 0441: VDDIO_1.8V_CAM (LDO7, 0x24) too, as the companion variant's sequence (fimc-is-module-4e6-c2.c) has it after
++	 * VDDD: the camera I2C's pull-up or level-shifter rail is a guess. 1.8 V = 0x30, the DTB's min = max. */
++	nc_read(0x59, 0x24, &l7, 1);
++	bool p7 = nc_pmic_write(0x24, 0x80 | 0x30);
+ 	delay(1000);
+ 	uint8_t r5 = 0, r6 = 0, r13 = 0;
+ 	nc_read(0x59, 0x22, &r5, 1);
+ 	nc_read(0x59, 0x23, &r6, 1);
+ 	nc_read(0x59, 0x2a, &r13, 1);
++	printf("NOTEFE CAM: front: VDDIO_1.8V_CAM (LDO7) %s, was %#x\n", p7 ? "on" : "FAILED", l7);
+ 	printf("NOTEFE CAM: front: VDDA 2.9 V (LDO13) %s %#x, VDDIO 1.8 V (LDO6) %s %#x, VDDD 1.2 V (LDO5) %s %#x\n",
+ 	    p13 ? "on" : "FAILED", r13, p6 ? "on" : "FAILED", r6, p5 ? "on" : "FAILED", r5);
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 1);            /* reset high */
+@@ -2075,6 +2080,7 @@ notefe_cam_front_id(vm_offset_t pins)
+ 	notefe_wr(top, 0xb24, div);
+ 	notefe_pin(pins, 0x100, 4, 1, 0, 0);
+ 	notefe_pin(pins, 0x120, 1, 1, 0, 0);
++	nc_pmic_write(0x24, l7 & 0x7f);
+ 	nc_pmic_write(0x22, l5 & 0x7f);
+ 	delay(2000);
+ 	nc_pmic_write(0x2a, l13 & 0x7f);

@@ -1,0 +1,49 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: herolog programs get the dyld-policy bit libsystem_trace needs before it reads OS_ACTIVITY_DT_MODE
+
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 6378ac0..245da0c 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -54,6 +54,14 @@ static int hgl_sb_launches;
+ static int hgl_app_pids[HGL_APP_PIDS];  /* the latest applications that got libheroapp */
+ static unsigned hgl_app_next;
+ 
++/*
++ * Note FE 0407: libsystem_trace reads OS_ACTIVITY_DT_MODE, OS_ACTIVITY_MODE and ACTIVITY_LOG_STDERR only when
++ * amfi_check_dyld_policy_self() answers with bit 8 (libsystem_trace 0x19c9cc400: byte 1 of the flags, bit 0), so 0405's
++ * OS_ACTIVITY_DT_MODE alone did nothing (boot 5: no line from tccd). The programs of boot-arg herolog get that bit.
++ */
++#define NOTEFE_DYLD_OUTPUT_ALLOW_LOG_ENV                (1ull << 8)
++bool herolte_log_name(const char *name);
++
+ uint64_t
+ herolte_gl_dyld_flags(void)
+ {
+@@ -61,11 +69,14 @@ herolte_gl_dyld_flags(void)
+ 	for (unsigned i = 0; i < HGL_APP_PIDS; i++) {
+ 		app = app || hgl_app_pids[i] == proc_selfpid();
+ 	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	uint64_t log = herolte_log_name(name) ? NOTEFE_DYLD_OUTPUT_ALLOW_LOG_ENV : 0;
+ 	if (!app && (hgl_pid < 0 || proc_selfpid() != hgl_pid) && (hgl_sb_pid < 0 || proc_selfpid() != hgl_sb_pid)) {
+-		return 0;
++		return log;
+ 	}
+ 	return AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+-	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
++	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | log;
+ }
+ 
+ /*
+@@ -180,6 +191,9 @@ herolte_gl_env(const char *path, int pid, const char **extra, int max)
+ 	base = base ? base + 1 : path;
+ 	if (herolte_log_name(base)) {
+ 		extra[n++] = "OS_ACTIVITY_DT_MODE=YES";
++		if (n < max) {
++			extra[n++] = "ACTIVITY_LOG_STDERR=1";      /* 0407: the other stderr switch libsystem_trace reads */
++		}
+ 		static unsigned announced;
+ 		if (announced++ < 40) {
+ 			printf("NOTEFE LOG: %s (pid %d) logs to the console\n", base, pid);

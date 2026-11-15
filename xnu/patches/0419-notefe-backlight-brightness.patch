@@ -1,0 +1,198 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 28b8f98..ad322c2 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -449,6 +449,32 @@ notefe_hid_sysctl SYSCTL_HANDLER_ARGS
+ 	return EINVAL;
+ }
+ 
++/*
++ * Note FE (0419): kern.notefe_brightness, 0-255 (12 at least). SpringBoard's bridge (notefe/herosb) writes iOS's
++ * brightness here, as Scion's brightness_bridge does on the Galaxy S9; read it back with sysctl.
++ */
++extern void notefe_brightness_set(uint32_t level, const char *why);
++extern uint32_t notefe_brightness_get(void);
++
++static int
++notefe_brightness_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)notefe_brightness_get();
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (value < 0 || value > 255) {
++		return EINVAL;
++	}
++	notefe_brightness_set((uint32_t)value, "sysctl");
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");
++
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_hid, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_hid_sysctl, "A", "Note FE: synthetic touches and keys (boot-arg herobot=1)");
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index bfa8f8f..33dccba 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1893,6 +1893,33 @@ herolte_fb_two_buffers(void)
+  * the rect to the point of coherency. False if the GPU failed (the caller
+  * falls back to the CPU copy).
+  */
++/* Note FE (0419): the panel's brightness, 255 = as drawn. Set by kern.notefe_brightness and the backlight service. */
++static volatile uint32_t notefe_bright_level = 255;
++
++void notefe_brightness_set(uint32_t level, const char *why);
++void
++notefe_brightness_set(uint32_t level, const char *why)
++{
++	static uint32_t logged;
++	if (level > 255) {
++		level = 255;
++	}
++	if (level < 12) {
++		level = 12;             /* never black: the slider at 0 is dim, as on an iPhone */
++	}
++	if (level != notefe_bright_level && (++logged <= 60 || logged % 50 == 0)) {
++		printf("NOTEFE BRIGHT: %u -> %u (%s)\n", notefe_bright_level, level, why);
++	}
++	notefe_bright_level = level;
++}
++
++uint32_t notefe_brightness_get(void);
++uint32_t
++notefe_brightness_get(void)
++{
++	return notefe_bright_level;
++}
++
+ static bool
+ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ {
+@@ -1942,6 +1969,14 @@ hgp_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
+ 		target_va = HG_PANEL2_VA;
+ 	}
+ 	hg_wr64(scr, S_FBD + 128 + 32, target_va);
++	/* Note FE (0419): brightness. Blend A + B * C with A = 0, B = source and C = the blend constant (level / 255),
++	 * instead of C = 1 - 0; alpha and the colour mask as before. 255: the copy exactly as before. */
++	{
++		uint32_t level = notefe_bright_level;
++		union { float f; uint32_t u; } k = { .f = (float)level / 255.0f };
++		hg_wr32(scr, S_RSD + 72, level >= 255 ? 0xf0921921u : 0xf0921721u);
++		hg_wr32(scr, S_RSD + 76, k.u);
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+ 	hg_run_quiet = true;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b5aabff..2083574 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -211,6 +211,88 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * Note FE (0419), after Scion's Galaxy S9 port (scion-kernel PRs 101/142): an AppleARMBacklight child of the display
++ * with IODisplayParameters (brightness 0-65536), so CoreBrightness finds a backlight the LCD way. Boot-arg notefe_bl=1
++ * publishes it (0, the default: none, as before). What iOS sets on it is logged and, if it is a brightness value, used.
++ * The level reaches the panel through kern.notefe_brightness (0-255, herolte_gl.c): the GPU's copy to the panel
++ * multiplies every pixel by it (herolte_gpu.c), which on this AMOLED is what brightness is.
++ */
++extern "C" void notefe_brightness_set(uint32_t level, const char *why);
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static void notefe_log_props(const char *who, OSObject *properties);
++
++static OSDictionary *
++notefe_range(uint32_t value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	if (d) {
++		OSNumber *n;
++		n = OSNumber::withNumber(0ULL, 32); d->setObject("min", n); n->release();
++		n = OSNumber::withNumber(65536ULL, 32); d->setObject("max", n); n->release();
++		n = OSNumber::withNumber((unsigned long long)value, 32); d->setObject("value", n); n->release();
++	}
++	return d;
++}
++
++static void
++notefe_backlight_publish(IOService *display)
++{
++	uint32_t on = 0;
++	PE_parse_boot_argn("notefe_bl", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++	if (bl == NULL || !bl->init()) {
++		IOLog("NOTEFE BRIGHT: backlight service not made\n");
++		return;
++	}
++	OSDictionary *params = OSDictionary::withCapacity(3);
++	OSDictionary *b = notefe_range(65536), *lb = notefe_range(65536), *commit = OSDictionary::withCapacity(1);
++	OSNumber *zero = OSNumber::withNumber(0ULL, 32);
++	commit->setObject("reg", zero);
++	params->setObject("brightness", b);
++	params->setObject("linear-brightness", lb);
++	params->setObject("commit", commit);
++	bl->setProperty("IODisplayParameters", params);
++	bl->setProperty("backlight-control", true);
++	bl->setName("backlight");
++	b->release(); lb->release(); commit->release(); zero->release(); params->release();
++	if (!bl->attach(display)) {
++		IOLog("NOTEFE BRIGHT: backlight service not attached\n");
++		bl->release();
++		return;
++	}
++	bl->registerService();
++	IOLog("NOTEFE BRIGHT: AppleARMBacklight published under the display\n");
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	notefe_log_props("backlight", properties);
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSDictionary *bright = dict ? OSDynamicCast(OSDictionary, dict->getObject("brightness")) : NULL;
++	OSNumber *v = bright ? OSDynamicCast(OSNumber, bright->getObject("value")) : NULL;
++	if (v == NULL && dict) {
++		v = OSDynamicCast(OSNumber, dict->getObject("brightness"));
++	}
++	if (v) {
++		uint64_t x = v->unsigned64BitValue();
++		notefe_brightness_set((uint32_t)(x >= 65536 ? 255 : x * 255 / 65536), "backlight");
++	}
++	return kIOReturnSuccess;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -411,11 +493,10 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+-	/* Note FE (0418): CoreBrightness matches {IOPropertyMatch: {backlight-control: true}} (-[CBDisplayContaineriOS
+-	 * findBacklight]); a match that is not an AppleARMBacklight is driven the OLED way, through this display. With
+-	 * none, brightness was "unavailable" and the Control Center slider stood still. */
+-	setProperty("backlight-control", true);
++	/* Note FE (0419): no "backlight-control" here any more. On the display itself it sent CoreBrightness down the
++	 * OLED path and backboardd stalled (boot 14). The backlight is a child service now (AppleARMBacklight, below). */
+ 	registerService();
++	notefe_backlight_publish(this);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)

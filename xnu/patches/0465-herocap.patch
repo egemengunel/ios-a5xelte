@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 8e3a536..98b31d1 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -26,6 +26,8 @@
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
++#include <sys/proc_internal.h>
++#include <kern/thread.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+@@ -186,9 +188,89 @@ herolte_log_name(const char *name)
+ 	return name != NULL && herolte_name_in(hlog_names, name, strlen(name));
+ }
+ 
++/*
++ * Note FE 0465: boot-arg herocap=name:percent,name:percent: those programs get XNU's task-wide CPU limit (THROTTLE, as
++ * 0324's herowidgetcap does for widget extensions). coreduetd spun at ~190% all boot long (cc-base1). A thread looks
++ * every 10 s for new processes of those names (the limit set at exec could be reset by the image's activation).
++ */
++extern int proc_set_task_ruse_cpu(task_t task, uint16_t policy, uint8_t percentage, uint64_t interval, uint64_t deadline,
++    int cpumon_entitled);
++static char hcap_arg[128];
++static int hcap_done_pid[32];
++static unsigned hcap_done_n;
++
++static int
++hcap_percent(const char *name)
++{
++	size_t nl = strlen(name);
++	for (const char *c = hcap_arg; *c != '\0';) {
++		const char *colon = strchr(c, ':');
++		if (colon == NULL) {
++			break;
++		}
++		size_t l = (size_t)(colon - c);
++		int pct = 0;
++		const char *d = colon + 1;
++		while (*d >= '0' && *d <= '9') {
++			pct = pct * 10 + (*d++ - '0');
++		}
++		if (l == nl && strncmp(c, name, l) == 0) {
++			return pct;
++		}
++		c = *d == ',' ? d + 1 : d;
++	}
++	return 0;
++}
++
++static int
++hcap_each(proc_t p, __unused void *arg)
++{
++	int pid = proc_getpid(p), pct = hcap_percent(p->p_comm);
++	if (pct <= 0 || pct > 100) {
++		return PROC_RETURNED;
++	}
++	for (unsigned i = 0; i < hcap_done_n && i < 32; i++) {
++		if (hcap_done_pid[i] == pid) {
++			return PROC_RETURNED;
++		}
++	}
++	int err = proc_set_task_ruse_cpu(proc_task(p), 0x01, (uint8_t)pct, 0, 0, 1);
++	hcap_done_pid[hcap_done_n++ % 32] = pid;
++	printf("NOTEFE CAP: %s[%d] limited to %d%% of a core: %d\n", p->p_comm, pid, pct, err);
++	return PROC_RETURNED;
++}
++
++static void
++hcap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		proc_iterate(PROC_ALLPROCLIST, hcap_each, NULL, NULL, NULL);
++		delay(10 * 1000 * 1000);
++	}
++}
++
++static void
++hcap_start(void)
++{
++	static int started;
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (!PE_parse_boot_argn("herocap", hcap_arg, sizeof(hcap_arg)) || hcap_arg[0] == '\0') {
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(hcap_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("NOTEFE CAP: herocap=%s\n", hcap_arg);
++	}
++}
++
+ int
+ herolte_gl_env(const char *path, int pid, const char **extra, int max)
+ {
++	hcap_start();
+ 	int n = herolte_gl_env_base(path, pid, extra, max);
+ 	if (n < 0 || path == NULL || n >= max) {
+ 		return n;

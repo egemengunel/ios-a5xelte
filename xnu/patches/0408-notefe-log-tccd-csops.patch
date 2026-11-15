@@ -1,0 +1,45 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: log the code-signing queries herolog programs (tccd) make about other processes
+
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 407a18b..9af8c6f 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -97,6 +97,9 @@
+ #include <sys/codesign.h>
+ #include <sys/kernel_types.h>
+ #include <sys/ubc.h>
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/ubc_internal.h>     /* Note FE 0408: struct cs_blob for the csops log */
++#endif
+ #include <kern/kalloc.h>
+ #include <kern/smr_hash.h>
+ #include <kern/task.h>
+@@ -3575,6 +3578,27 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		break;
+ 	}
+ out:
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * Note FE 0408: what the code-signing queries of the boot-arg herolog programs (tccd: SecTask and
++	 * xpc_copy_entitlement_for_token use CS_OPS_STATUS 0, CS_OPS_IDENTITY 11, CS_OPS_DER_ENTITLEMENTS_BLOB 16) get back
++	 * about other processes: assetsd's "requires TCCPhotosService access" is tccd saying no to an entitled client.
++	 */
++	{
++		extern bool herolte_log_name(const char *name);
++		char me[32];
++		proc_selfname(me, sizeof(me));
++		if (herolte_log_name(me) && pt != current_proc()) {
++			static unsigned logged;
++			if (logged++ < 400) {
++				struct cs_blob *b = csproc_get_blob(pt);
++				printf("NOTEFE CSOPS: %s asks op %d about %s[%d]: error %d, csflags %#x, blob %s, der %s, platform %d\n",
++				    me, ops, proc_best_name(pt), upid, error, proc_getcsflags(pt), b ? "yes" : "no",
++				    b ? (b->csb_der_entitlements_blob ? "yes" : "no") : "-", b ? b->csb_platform_binary : -1);
++			}
++		}
++	}
++#endif
+ 	proc_rele(pt);
+ 	return error;
+ }

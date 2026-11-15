@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index ad322c2..f75f090 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -472,6 +472,96 @@ notefe_brightness_sysctl SYSCTL_HANDLER_ARGS
+ 	return 0;
+ }
+ 
++/*
++ * Note FE (0432): Bluetooth step 1, read only. The BCM4359's Bluetooth half sits on UART1 (0x14c20000, "btdefault"
++ * pins gpe0-0..3 function 2, IRQ SPI 0x1b0) with BT_REG_ON on gpj1-7 (PERIC1 pins 0x14cc0000, bank +0x60), BT_WAKE on
++ * gpi2-3 (0x10e60000 +0x20) and HOST_WAKE on gpa2-3 (ALIVE 0x10580000 +0x40), from the phone's own DTB (bluetooth node,
++ * compatible broadcom,bcm4359). Bank stride 0x20 as 0211/heroaudio's GPE6 0x40 / GPE2 0xa0. Clocks (Samsung's pwrcal for
++ * the 8890): CMU_TOP 0x10570000 mux 0x354 / div 0x4b4 / enable 0x960 of SCLK_PERIC1_UART1; CMU_PERIC1 0x14c80000 mux
++ * 0x224 (SCLK_UART1_USER), CG_CTRL_VAL 0x800 bit 13 (PCLK_UART1) and 0x860 bit 0 (SCLK_UART1), manual 0x1800/0x1860,
++ * Q-state 0x2424. `sysctl kern.notefe_bt=1` (root) logs the clocks and pins; =2 also the UART's registers, but only
++ * when both of its clocks read as on (a gated block can stop the bus). Nothing is written. Klog `NOTEFE BT:`.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++static int notefe_bt_last;
++
++static uint32_t
++notefe_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++notefe_bt_bank(const char *name, vm_offset_t base, uint32_t off, unsigned pin)
++{
++	uint32_t con = notefe_rd(base, off), dat = notefe_rd(base, off + 4), pud = notefe_rd(base, off + 8);
++	printf("NOTEFE BT: %s con %#x dat %#x pud %#x drv %#x conpdn %#x pudpdn %#x; pin %u: func %u level %u pull %u\n",
++	    name, con, dat, pud, notefe_rd(base, off + 0xc), notefe_rd(base, off + 0x10), notefe_rd(base, off + 0x14), pin,
++	    (con >> (4 * pin)) & 0xf, (dat >> pin) & 1, (pud >> (4 * pin)) & 0xf);
++}
++
++static void
++notefe_bt_probe(int level)
++{
++	static vm_offset_t top, peric1, pins, pins_i, alive, uart;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++		peric1 = ml_io_map(0x14c80000u, 0x3000);
++		pins = ml_io_map(0x14cc0000u, 0x1000);
++		pins_i = ml_io_map(0x10e60000u, 0x1000);
++		alive = ml_io_map(0x10580000u, 0x1000);
++		uart = ml_io_map(0x14c20000u, 0x1000);
++	}
++	if (!top || !peric1 || !pins || !pins_i || !alive || !uart) {
++		printf("NOTEFE BT: map failed\n");
++		return;
++	}
++	uint32_t pclk = notefe_rd(peric1, 0x800), sclk = notefe_rd(peric1, 0x860);
++	printf("NOTEFE BT: TOP uart1 mux %#x div %#x enable %#x\n", notefe_rd(top, 0x354), notefe_rd(top, 0x4b4),
++	    notefe_rd(top, 0x960));
++	printf("NOTEFE BT: PERIC1 mux_user %#x aclk66_user %#x val %#x (pclk_uart1 %u) sclk %#x man %#x %#x qstate %#x\n",
++	    notefe_rd(peric1, 0x224), notefe_rd(peric1, 0x200), pclk, (pclk >> 13) & 1, sclk, notefe_rd(peric1, 0x1800),
++	    notefe_rd(peric1, 0x1860), notefe_rd(peric1, 0x2424));
++	notefe_bt_bank("gpe0 (uart1 rx/tx/rts/cts)", pins, 0x00, 0);
++	notefe_bt_bank("gpj1 (BT_REG_ON)", pins, 0x60, 7);
++	notefe_bt_bank("gpi2 (BT_WAKE)", pins_i, 0x20, 3);
++	notefe_bt_bank("gpa2 (BT_HOST_WAKE)", alive, 0x40, 3);
++	if (level < 2) {
++		return;
++	}
++	if (!((pclk >> 13) & 1) || !(sclk & 1)) {
++		printf("NOTEFE BT: uart1 clocks off, registers not read\n");
++		return;
++	}
++	for (uint32_t o = 0; o < 0x40; o += 0x10) {
++		printf("NOTEFE BT: uart1 +%#04x: %#x %#x %#x %#x\n", o, notefe_rd(uart, o), notefe_rd(uart, o + 4),
++		    notefe_rd(uart, o + 8), notefe_rd(uart, o + 12));
++	}
++}
++
++static int
++notefe_bt_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = notefe_bt_last;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (value < 1 || value > 2) {
++		return EINVAL;
++	}
++	notefe_bt_last = value;
++	notefe_bt_probe(value);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, notefe_bt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, notefe_bt_sysctl, "I", "Note FE: Bluetooth probe (1 clocks/pins, 2 + UART1 registers), read only");
++
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_brightness_sysctl, "I", "Note FE: panel brightness 0-255");
+ 

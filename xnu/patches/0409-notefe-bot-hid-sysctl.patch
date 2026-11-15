@@ -1,0 +1,89 @@
+From: Note FE port
+Subject: [PATCH] gracerlte: sysctl kern.notefe_hid (boot-arg herobot=1): synthetic touches and keys for unattended tests
+
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 245da0c..d799cb7 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -20,6 +20,8 @@
+ #include <sys/proc.h>
+ #include <string.h>
+ #include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
++#include <sys/kauth.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+@@ -314,4 +316,72 @@ herolte_gl_env_base(const char *path, int pid, const char **extra, int max)
+ 	    launch, hgl_pid, hgl_mode);
+ 	return n;
+ }
++/*
++ * Note FE 0409: boot-arg herobot=1 makes sysctl kern.notefe_hid writable by root: "t FINGER DOWN X Y" (panel pixels,
++ * 1440x2560; DOWN 1 again is a move, 0 lifts) and "k KEY DOWN" (0 power, 1 volume up, 2 volume down, 3 home) go to the
++ * same HID services as the real touch screen and keys (sweet_hid_touch / sweet_hid_key). notefe/bot (the drop zone's
++ * test program) uses it to open apps, swipe and scroll unattended, so a boot can be measured without anyone holding it.
++ */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++
++static int
++notefe_parse_int(const char **p, int *out)
++{
++	const char *s = *p;
++	while (*s == ' ') {
++		s++;
++	}
++	int sign = 1, v = 0, digits = 0;
++	if (*s == '-') {
++		sign = -1;
++		s++;
++	}
++	while (*s >= '0' && *s <= '9') {
++		v = v * 10 + (*s++ - '0');
++		digits++;
++	}
++	*p = s;
++	*out = v * sign;
++	return digits > 0;
++}
++
++static int
++notefe_hid_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static int enabled = -1;
++	if (enabled < 0) {
++		enabled = 0;
++		PE_parse_boot_argn("herobot", &enabled, sizeof(enabled));
++	}
++	char cmd[64] = "";
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, enabled ? "on" : "off", enabled ? 3 : 4);
++	}
++	if (!enabled || !kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	size_t len = MIN(req->newlen, sizeof(cmd) - 1);
++	int error = SYSCTL_IN(req, cmd, len);
++	if (error) {
++		return error;
++	}
++	cmd[len] = '\0';
++	const char *p = cmd + 1;
++	int a, b, c, d;
++	if (cmd[0] == 't' && notefe_parse_int(&p, &a) && notefe_parse_int(&p, &b) && notefe_parse_int(&p, &c) &&
++	    notefe_parse_int(&p, &d) && a >= 0 && a < 10 && c >= 0 && c < 1440 && d >= 0 && d < 2560) {
++		sweet_hid_touch(a, b, c, d);
++		return 0;
++	}
++	if (cmd[0] == 'k' && notefe_parse_int(&p, &a) && notefe_parse_int(&p, &b) && a >= 0 && a <= 3) {
++		sweet_hid_key(a, b);
++		return 0;
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, notefe_hid, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, notefe_hid_sysctl, "A", "Note FE: synthetic touches and keys (boot-arg herobot=1)");
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */

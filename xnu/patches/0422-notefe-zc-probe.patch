@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 33dccba..5aed2da 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1866,6 +1866,35 @@ hfb_setup_locked(void)
+ 	hg_wr(hfb_idma, 0x04, 1u << 19);        /* a stale read error is not ours */
+ 	hfb_state = 1;
+ 	printf("HEROLTE FB2: two buffers, %#llx and %#llx (GPU VA %#llx), on IDMA G1\n", HG_FB_PA, HG_FB2_PA, HG_PANEL2_VA);
++	/*
++	 * Note FE (0422), zero-copy step 1, read only: how S-Boot left the scaling channel VG0 (0x13953000; same clock,
++	 * 850, and power domain, DISP0 at 0x105c4080, as G1, which is in use) next to G1, and the DECON's windows
++	 * (WIN_CONTROL 0x130 + 0x20 w and the rest of each window's block). Register names: Samsung's decon_8890/vpp.
++	 */
++	{
++		vm_offset_t vg0 = ml_io_map(0x13953000u, 0x1000);
++		for (unsigned o = 0; vg0 && o < 0x80; o += 0x20) {
++			printf("NOTEFE ZC: VG0 +%#04x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(vg0, o), hg_rd(vg0, o + 4),
++			    hg_rd(vg0, o + 8), hg_rd(vg0, o + 12), hg_rd(vg0, o + 16), hg_rd(vg0, o + 20), hg_rd(vg0, o + 24),
++			    hg_rd(vg0, o + 28));
++		}
++		for (unsigned o = 0; o < 0x80; o += 0x20) {
++			printf("NOTEFE ZC: G1  +%#04x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(hfb_idma, o),
++			    hg_rd(hfb_idma, o + 4), hg_rd(hfb_idma, o + 8), hg_rd(hfb_idma, o + 12), hg_rd(hfb_idma, o + 16),
++			    hg_rd(hfb_idma, o + 20), hg_rd(hfb_idma, o + 24), hg_rd(hfb_idma, o + 28));
++		}
++		for (unsigned w = 0; decon && w < 7; w++) {
++			unsigned b = 0x130 + 0x20 * w;
++			printf("NOTEFE ZC: DECON win %u +%#x: %#x %#x %#x %#x %#x %#x %#x %#x\n", w, b, hg_rd(decon, b),
++			    hg_rd(decon, b + 4), hg_rd(decon, b + 8), hg_rd(decon, b + 12), hg_rd(decon, b + 16),
++			    hg_rd(decon, b + 20), hg_rd(decon, b + 24), hg_rd(decon, b + 28));
++		}
++		for (unsigned o = 0; decon && o < 0x130; o += 0x20) {
++			printf("NOTEFE ZC: DECON +%#05x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(decon, o), hg_rd(decon, o + 4),
++			    hg_rd(decon, o + 8), hg_rd(decon, o + 12), hg_rd(decon, o + 16), hg_rd(decon, o + 20),
++			    hg_rd(decon, o + 24), hg_rd(decon, o + 28));
++		}
++	}
+ }
+ 
+ /* For the CPU's writes into the first buffer (SweetFramebuffer.cpp): that one shown again first. */
